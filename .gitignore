@@ -1,0 +1,20 @@
+# Runtime state
+*.log
+*.tmp
+
+# Generated reports
+reports/*
+!reports/.gitkeep
+
+# Local state
+.devil-state/
+
+# Test artifacts
+coverage/
+test-results/
+
+# Editor / OS files
+.vscode/
+.idea/
+*.swp
+.DS_Store
