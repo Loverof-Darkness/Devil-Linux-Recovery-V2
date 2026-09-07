@@ -10,6 +10,8 @@ from devil import __version__
 from devil.discovery.commands import CommandRunner
 from devil.discovery.scanner import scan
 from devil.discovery.selector import choose_linux, render_systems
+from devil.planning.render import render_target
+from devil.planning.target import resolve_selected_linux
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -21,6 +23,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--diagnose", action="store_true", help="run read-only system discovery")
     parser.add_argument("--json", action="store_true", help="emit discovery as JSON")
     parser.add_argument("--select", action="store_true", help="select a detected Linux installation for inspection")
+    parser.add_argument("--plan", action="store_true", help="select a Linux installation and resolve its read-only target layout")
     parser.add_argument("--dry-run", action="store_true", help="show discovery-only dry-run status")
     return parser
 
@@ -28,7 +31,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
 
-    if args.dry_run and not (args.diagnose or args.json or args.select):
+    if args.dry_run and not (args.diagnose or args.json or args.select or args.plan):
         print("DEVIL V2 dry-run: discovery only; no system changes are possible")
         return 0
 
@@ -44,19 +47,32 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Partitions discovered: {len(snapshot.partitions)}")
     print(f"EFI entries discovered: {len(snapshot.efi_entries)}")
     print()
-    print(render_systems(snapshot.operating_systems) if snapshot.operating_systems else "No operating systems confidently identified from current mounts.")
+    print(
+        render_systems(snapshot.operating_systems)
+        if snapshot.operating_systems
+        else "No operating systems confidently identified from current mounts."
+    )
 
     if snapshot.warnings:
         print("\nWarnings:")
         for warning in snapshot.warnings:
             print(f"  - {warning}")
 
-    if args.select:
+    if args.select or args.plan:
         linux = [item for item in snapshot.operating_systems if item.family.lower() == "linux"]
         if not linux:
             print("\nNo safe Linux recovery candidates are available.")
             return 2
         answer = input("\nSelect Linux installation [number]: ")
+        if args.plan:
+            target = resolve_selected_linux(snapshot, snapshot.operating_systems, _safe_int(answer))
+            if target is None:
+                print("Selection rejected: invalid Linux candidate. No changes were made.")
+                return 2
+            print()
+            print(render_target(target))
+            return 0 if target.safe else 2
+
         selected = choose_linux(snapshot.operating_systems, answer)
         if selected is None:
             print("Selection rejected: invalid or unsafe candidate. No changes were made.")
@@ -67,6 +83,13 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     return 0
+
+
+def _safe_int(value: str) -> int:
+    try:
+        return int(value.strip())
+    except ValueError:
+        return -1
 
 
 if __name__ == "__main__":
