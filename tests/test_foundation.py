@@ -18,7 +18,14 @@ class FoundationTests(unittest.TestCase):
             self.assertEqual(detect_firmware_mode(tmp), "UEFI")
 
     def test_operating_system_model(self) -> None:
-        os_record = OperatingSystem(name="Garuda Linux", family="Linux", confidence=1.0)
+        os_record = OperatingSystem(
+            os_id="linux-1",
+            name="Garuda Linux",
+            family="Linux",
+            root_device="/dev/nvme0n1p2",
+            root_filesystem="btrfs",
+            confidence="high",
+        )
         self.assertTrue(os_record.is_linux())
 
 
