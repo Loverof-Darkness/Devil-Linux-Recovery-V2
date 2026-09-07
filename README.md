@@ -170,12 +170,12 @@ bash launcher/devil.sh --source
 ├── devil/                # Python application package
 │   ├── cli.py
 │   ├── models/
-│   ├── detectors/
-│   ├── planners/
-│   ├── recovery/
-│   ├── adapters/
-│   ├── ui/
-│   └── reporting/
+│   ├── discovery/       # read-only storage, OS, EFI and firmware discovery
+│   ├── planning/        # read-only target resolution and repair planning
+│   ├── recovery/        # future mutation-capable recovery engine
+│   ├── adapters/        # future reviewed native command adapters
+│   ├── ui/              # future terminal presentation layer
+│   └── reporting/       # future structured recovery reports
 ├── scripts/              # Small, reviewable shell operations
 ├── tests/                # Unit and safety-focused tests
 ├── docs/                 # Architecture, recovery model, safety policy
@@ -278,9 +278,9 @@ The implementation must enforce:
 
 ## Project status
 
-**Current stage:** V2 foundation.
+**Current stage:** V2.3 — canonical discovery model + read-only target-layout resolution.
 
-The repository is intentionally being built in small, testable layers. Recovery actions will be added only after the discovery and safety model can accurately represent the systems they are expected to repair.
+The current implementation can inventory discovered storage and firmware state, present Linux candidates, and resolve a selected candidate into a read-only target layout while blocking ambiguous EFI/root mappings. Recovery mutations have not yet been enabled.
 
 ## License
 
