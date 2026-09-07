@@ -1,0 +1,34 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Compile Python package
+        run: python -m compileall -q devil
+
+      - name: Run unit tests
+        run: python -m unittest discover -s tests -q
+
+      - name: Shell syntax check
+        run: bash -n launcher/devil.sh
+
+      - name: Bootstrap source smoke test
+        run: bash launcher/devil.sh --source --diagnose
