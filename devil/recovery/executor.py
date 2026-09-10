@@ -80,8 +80,8 @@ class RecoveryExecutor:
             self._preflight_target(plan, report)
             self._backup_efi(report)
             self._install_grub(report)
-            self._promote_boot_order(report)
             self._regenerate_config(report)
+            self._promote_boot_order(report)
             self._verify(report)
             report.success = True
         except Exception as exc:
