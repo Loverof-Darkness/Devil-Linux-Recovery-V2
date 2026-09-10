@@ -188,6 +188,23 @@ class RecoveryExecutor:
             raise RecoveryError(f"EFI backup failed: {result.stderr.strip()}")
         report.add("backup-efi", "ok", str(archive))
 
+    @staticmethod
+    def _find_efi_entry_number(output: str, label: str) -> str | None:
+        for line in output.splitlines():
+            match = re.match(r"^Boot([0-9A-Fa-f]{4})(?:\*|\s+)?\s*(.+?)\s*$", line)
+            if not match:
+                continue
+            if match.group(2).strip().lower().startswith(label.lower()):
+                return match.group(1).upper()
+        return None
+
+    @staticmethod
+    def _boot_order(output: str) -> list[str] | None:
+        match = re.search(r"^BootOrder:\s*([0-9A-Fa-f,]+)\s*$", output, re.MULTILINE)
+        if not match:
+            return None
+        return [item.upper() for item in match.group(1).split(",") if item]
+
     def _install_grub(self, report: RepairReport) -> None:
         assert self._temp_root is not None
         root = self._temp_root / "root"
@@ -217,21 +234,20 @@ class RecoveryExecutor:
         result = self._command(("efibootmgr", "--verbose"), None)
         if result.returncode != 0:
             raise RecoveryError(f"EFI entry read failed after GRUB installation: {result.stderr.strip()}")
-        match = re.search(r"^Boot([0-9A-Fa-f]{4})[ *]+DEVIL-GRUB(?:\s|$)", result.stdout, re.MULTILINE | re.IGNORECASE)
-        if not match:
+        devil_number = self._find_efi_entry_number(result.stdout, "DEVIL-GRUB")
+        if not devil_number:
             raise RecoveryError("DEVIL-GRUB EFI entry was not found after installation")
-        devil_number = match.group(1).upper()
-        order_match = re.search(r"^BootOrder:\s*([0-9A-Fa-f,]+)", result.stdout, re.MULTILINE)
-        if not order_match:
+        current = self._boot_order(result.stdout)
+        if current is None:
             raise RecoveryError("firmware BootOrder was not reported")
-        current = [item.upper() for item in order_match.group(1).split(",") if item]
         new_order = [devil_number] + [item for item in current if item != devil_number]
         if current == new_order:
             report.add("promote-bootorder", "ok", f"DEVIL-GRUB {devil_number} was already first")
             return
         set_result = self._command(("efibootmgr", "-o", ",".join(new_order)), None)
         if set_result.returncode != 0:
-            raise RecoveryError(f"BootOrder update failed: {set_result.stderr.strip()}")
+            detail = set_result.stderr.strip() or set_result.stdout.strip()
+            raise RecoveryError(f"BootOrder update failed: {detail}")
         report.add("promote-bootorder", "ok", f"BootOrder set to {','.join(new_order)}")
 
     def _regenerate_config(self, report: RepairReport) -> None:
@@ -266,15 +282,15 @@ class RecoveryExecutor:
         after = self._command(("efibootmgr", "--verbose"), None)
         if after.returncode != 0:
             raise RecoveryError("EFI verification failed")
-        lower = after.stdout.lower()
-        if "devil-grub" not in lower:
+        devil_number = self._find_efi_entry_number(after.stdout, "DEVIL-GRUB")
+        if not devil_number:
             raise RecoveryError("new DEVIL-GRUB EFI entry was not observed")
-        if "windows boot manager" in self._efi_before.lower() and "windows boot manager" not in lower:
-            raise RecoveryError("Windows Boot Manager disappeared during repair")
-        order_match = re.search(r"^BootOrder:\s*([0-9A-Fa-f,]+)", after.stdout, re.MULTILINE)
-        devil_match = re.search(r"^Boot([0-9A-Fa-f]{4})[ *]+DEVIL-GRUB(?:\s|$)", after.stdout, re.MULTILINE | re.IGNORECASE)
-        if not order_match or not devil_match or order_match.group(1).split(",")[0].upper() != devil_match.group(1).upper():
+        if self._boot_order(after.stdout) is None or self._boot_order(after.stdout)[0] != devil_number:
             raise RecoveryError("DEVIL-GRUB is not first in firmware BootOrder after repair")
+        lower_before = self._efi_before.lower()
+        lower_after = after.stdout.lower()
+        if "windows boot manager" in lower_before and "windows boot manager" not in lower_after:
+            raise RecoveryError("Windows Boot Manager disappeared during repair")
         report.add(
             "verify-efi",
             "ok",
