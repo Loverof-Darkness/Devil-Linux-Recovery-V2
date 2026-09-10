@@ -1,6 +1,6 @@
 """Build a non-executing recovery plan from a resolved target.
 
-The planner never runs shell commands.  Every mutation is represented as an
+The planner never runs shell commands. Every mutation is represented as an
 explicit step with a risk level and a requirement for human confirmation.
 """
 from __future__ import annotations
@@ -52,10 +52,8 @@ def build_repair_plan(target: TargetLayout) -> RepairPlan:
 
     if target.firmware_mode.lower() != "uefi":
         reasons.append("automatic mutation is currently limited to UEFI targets")
-
     if not target.root_device:
         reasons.append("Linux root device is unresolved")
-
     if not target.efi_device:
         reasons.append("EFI System Partition is unresolved")
 
@@ -92,6 +90,14 @@ def build_repair_plan(target: TargetLayout) -> RepairPlan:
             "Install/reinstall GRUB for UEFI",
             "Run the target distribution's GRUB installer against the selected EFI System Partition without touching unrelated operating systems.",
             "install_grub_uefi",
+            "HIGH",
+            reversible=True,
+        ),
+        RepairStep(
+            "promote-bootorder",
+            "Put the repaired Linux loader first",
+            "Set the new DEVIL-GRUB EFI entry first in BootOrder while preserving every existing entry after it.",
+            "promote_boot_order",
             "HIGH",
             reversible=True,
         ),
