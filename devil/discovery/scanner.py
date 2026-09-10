@@ -89,48 +89,35 @@ def scan(runner: CommandRunner | None = None, probe: ReadOnlyFilesystemProbe | N
     esp_parts = [p for p in snapshot.partitions if p.esp]
     unique_efi_device = esp_parts[0].device if len(esp_parts) == 1 else None
 
-    # Mounted roots can be identified without changing anything.
-    mounted_linux = [p for p in snapshot.partitions if p.filesystem in _LINUX_FS and p.mountpoint]
-    for index, part in enumerate(mounted_linux, 1):
-        snapshot.operating_systems.append(
-            OperatingSystem(
-                os_id=f"linux-mounted-{index}",
-                name=part.label or "Linux installation",
-                family="linux",
-                root_device=part.device,
-                root_mountpoint=part.mountpoint,
-                efi_device=unique_efi_device,
-                firmware_mode=snapshot.firmware_mode,
-                confidence="medium",
-            )
-        )
-
-    # Live-USB environments usually leave installed roots unmounted. Probe those
-    # filesystems read-only when privileges and mount support are available.
+    # Identify Linux roots from actual filesystem evidence. This works for both
+    # already-mounted installations and unmounted installations in a Live USB.
     result = probe.probe_linux(snapshot.partitions, snapshot.firmware_mode, unique_efi_device)
-    existing_devices = {system.root_device for system in snapshot.operating_systems}
+    seen_linux_devices: set[str] = set()
     for system in result.operating_systems:
-        if system.root_device not in existing_devices:
+        if system.root_device and system.root_device not in seen_linux_devices:
             snapshot.operating_systems.append(system)
+            seen_linux_devices.add(system.root_device)
     snapshot.warnings.extend(result.warnings)
 
-    # Probe each ESP for an actual Microsoft loader. Multiple ESPs are still
-    # ambiguous for repairing Linux, but should not hide evidence of Windows.
-    windows_found = set()
+    # Probe every discovered ESP for the actual Microsoft loader. Multiple ESPs
+    # remain ambiguous for repair, but their evidence is still useful.
+    windows_found = False
     for esp in esp_parts:
         windows_probe = probe.probe_windows_efi(esp, snapshot.firmware_mode)
         for system in windows_probe.operating_systems:
-            if system.os_id not in windows_found:
+            if not any(item.family.lower() == "windows" for item in snapshot.operating_systems):
                 snapshot.operating_systems.append(system)
-                windows_found.add(system.os_id)
+                windows_found = True
         snapshot.warnings.extend(windows_probe.warnings)
 
-    # Firmware entries provide additional Windows evidence when filesystem
-    # probing is unavailable (for example when no ESP can be mounted).
+    # Firmware entries provide additional Windows evidence if the ESP cannot
+    # currently be inspected.
     windows_entry_names = tuple(
         entry.label for entry in snapshot.efi_entries if "windows" in entry.label.lower()
     )
-    if windows_entry_names and not any(item.family.lower() == "windows" for item in snapshot.operating_systems):
+    if windows_entry_names and not windows_found and not any(
+        item.family.lower() == "windows" for item in snapshot.operating_systems
+    ):
         snapshot.operating_systems.append(
             OperatingSystem(
                 os_id="windows-efi-entry",
