@@ -1,0 +1,243 @@
+"""Guarded executor for the first real DEVIL repair workflow.
+
+The executor is deliberately narrow: UEFI + GRUB only, a previously resolved
+safe target, explicit confirmation, and transactional cleanup.  It never
+formats partitions, deletes EFI files, edits Windows loaders, or uses a shell.
+"""
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import subprocess
+import tempfile
+from dataclasses import asdict, dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Callable, Sequence
+
+from devil.planning.repair import RepairPlan
+
+
+class RecoveryError(RuntimeError):
+    """Raised when a guarded recovery operation cannot safely continue."""
+
+
+@dataclass
+class RepairReport:
+    started_at: str
+    finished_at: str | None = None
+    target_os: str = ""
+    success: bool = False
+    steps: list[dict[str, object]] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+
+    def add(self, step: str, status: str, detail: str = "") -> None:
+        self.steps.append({"step": step, "status": status, "detail": detail})
+
+    def to_dict(self) -> dict[str, object]:
+        return asdict(self)
+
+
+CommandFn = Callable[[Sequence[str], Path | None], subprocess.CompletedProcess[str]]
+
+
+class RecoveryExecutor:
+    """Execute only the supported UEFI repair plan after explicit confirmation."""
+
+    def __init__(self, command: CommandFn | None = None) -> None:
+        self._command = command or self._run
+        self._mounted: list[Path] = []
+        self._temp_root: Path | None = None
+
+    @staticmethod
+    def _run(argv: Sequence[str], cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            list(argv),
+            cwd=str(cwd) if cwd else None,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+
+    def execute(self, plan: RepairPlan, *, confirmation: str = "", report_path: str | None = None) -> RepairReport:
+        self._validate(plan, confirmation)
+        started = datetime.now(timezone.utc).isoformat()
+        report = RepairReport(started_at=started, target_os=plan.target.os_name)
+        try:
+            self._require_tools()
+            self._capture_state(report)
+            self._mount_target(plan, report)
+            backup_dir = self._backup_efi(report)
+            self._install_grub(plan, report)
+            self._regenerate_config(report)
+            self._verify(plan, report)
+            report.add("cleanup", "ok", "temporary mounts removed")
+            report.success = True
+        except Exception as exc:
+            report.add("recovery", "failed", str(exc))
+            report.warnings.append("Repair stopped at first failure; inspect the report before retrying.")
+            report.warnings.append("Existing EFI files are preserved; no Windows loader deletion is attempted.")
+        finally:
+            self._cleanup(report)
+            report.finished_at = datetime.now(timezone.utc).isoformat()
+            if report_path:
+                Path(report_path).write_text(json.dumps(report.to_dict(), indent=2) + "\n", encoding="utf-8")
+        return report
+
+    def _validate(self, plan: RepairPlan, confirmation: str) -> None:
+        if not plan.supported or not plan.safe_to_execute:
+            raise RecoveryError("repair plan is blocked and cannot be executed")
+        if plan.target.firmware_mode.lower() != "uefi":
+            raise RecoveryError("only UEFI recovery is currently executable")
+        if not plan.target.root_device or not plan.target.efi_device:
+            raise RecoveryError("target root and EFI devices are required")
+        if os.geteuid() != 0:
+            raise RecoveryError("recovery execution requires root privileges")
+        if confirmation.strip() != "REPAIR":
+            raise RecoveryError("explicit confirmation token REPAIR is required")
+
+    def _require_tools(self) -> None:
+        required = ("mount", "umount", "chroot", "grub-install", "efibootmgr")
+        optional = ("update-grub", "grub-mkconfig", "grub2-mkconfig")
+        missing = [tool for tool in required if shutil.which(tool) is None]
+        if missing:
+            raise RecoveryError("missing required host tools: " + ", ".join(missing))
+        if not any(shutil.which(tool) for tool in optional):
+            raise RecoveryError("no GRUB configuration generator found")
+
+    def _capture_state(self, report: RepairReport) -> None:
+        result = self._command(("efibootmgr", "--verbose"), None)
+        if result.returncode != 0:
+            raise RecoveryError(f"efibootmgr pre-check failed: {result.stderr.strip()}")
+        self._efi_before = result.stdout
+        report.add("capture-state", "ok", "captured current EFI variables")
+
+    def _mount_target(self, plan: RepairPlan, report: RepairReport) -> None:
+        self._temp_root = Path(tempfile.mkdtemp(prefix="devil-recovery-"))
+        root = self._temp_root / "root"
+        root.mkdir()
+
+        mount_args = ["mount", "-o", "rw"]
+        fs = (plan.target.root_filesystem or "").lower()
+        if fs == "btrfs" and plan.target.root_subvolume:
+            mount_args.extend(["-o", f"subvol={plan.target.root_subvolume}"])
+        mount_args.extend([plan.target.root_device, str(root)])
+        self._run_checked(mount_args, None, "mount Linux root")
+        self._mounted.append(root)
+
+        boot_target = root / "boot"
+        boot_target.mkdir(exist_ok=True)
+        if plan.target.boot_device:
+            self._run_checked(("mount", "-o", "rw", plan.target.boot_device, str(boot_target)), None, "mount /boot")
+            self._mounted.append(boot_target)
+
+        efi_target = boot_target / "efi"
+        efi_target.mkdir(exist_ok=True)
+        self._run_checked(("mount", "-o", "rw", plan.target.efi_device, str(efi_target)), None, "mount EFI System Partition")
+        self._mounted.append(efi_target)
+
+        for directory in ("/dev", "/dev/pts", "/proc", "/sys", "/run"):
+            destination = root / directory.lstrip("/")
+            destination.mkdir(parents=True, exist_ok=True)
+            self._run_checked(("mount", "--rbind", directory, str(destination)), None, f"bind {directory}")
+            self._run_checked(("mount", "--make-rslave", str(destination)), None, f"isolate {directory}")
+            self._mounted.append(destination)
+        report.add("mount-target", "ok", f"mounted target under {root}")
+
+    def _backup_efi(self, report: RepairReport) -> Path:
+        assert self._temp_root is not None
+        backup = self._temp_root / "root" / "var" / "lib" / "devil" / "backups" / datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        backup.mkdir(parents=True, exist_ok=True)
+        efi = self._temp_root / "root" / "boot" / "efi"
+        archive = backup / "efi-tree.tar"
+        result = self._command(("tar", "-cpf", str(archive), "-C", str(efi), "."), None)
+        if result.returncode != 0:
+            raise RecoveryError(f"EFI backup failed: {result.stderr.strip()}")
+        report.add("backup-efi", "ok", str(archive))
+        return backup
+
+    def _install_grub(self, plan: RepairPlan, report: RepairReport) -> None:
+        assert self._temp_root is not None
+        root = self._temp_root / "root"
+        efi = root / "boot" / "efi"
+        loader_id = "DEVIL-GRUB"
+        argv = (
+            "chroot",
+            str(root),
+            "/usr/sbin/grub-install",
+            "--target=x86_64-efi",
+            f"--efi-directory={efi.relative_to(root)}",
+            f"--bootloader-id={loader_id}",
+            "--recheck",
+        )
+        result = self._command(argv, None)
+        if result.returncode != 0:
+            fallback = (
+                "chroot", str(root), "grub-install",
+                "--target=x86_64-efi",
+                f"--efi-directory={efi.relative_to(root)}",
+                f"--bootloader-id={loader_id}",
+                "--recheck",
+            )
+            result = self._command(fallback, None)
+        if result.returncode != 0:
+            raise RecoveryError(f"GRUB installation failed: {result.stderr.strip()}")
+        report.add("install-grub", "ok", f"installed UEFI loader {loader_id}")
+
+    def _regenerate_config(self, report: RepairReport) -> None:
+        assert self._temp_root is not None
+        root = self._temp_root / "root"
+        candidates = (
+            ("chroot", str(root), "update-grub"),
+            ("chroot", str(root), "grub-mkconfig", "-o", "/boot/grub/grub.cfg"),
+            ("chroot", str(root), "grub2-mkconfig", "-o", "/boot/grub2/grub.cfg"),
+        )
+        for argv in candidates:
+            if argv[2] == "update-grub" and not self._inside_exists(root, "/usr/sbin/update-grub") and not self._inside_exists(root, "/usr/bin/update-grub"):
+                continue
+            if argv[2] == "grub-mkconfig" and not self._inside_exists(root, "/usr/sbin/grub-mkconfig") and not self._inside_exists(root, "/usr/bin/grub-mkconfig"):
+                continue
+            if argv[2] == "grub2-mkconfig" and not self._inside_exists(root, "/usr/sbin/grub2-mkconfig") and not self._inside_exists(root, "/usr/bin/grub2-mkconfig"):
+                continue
+            result = self._command(argv, None)
+            if result.returncode == 0:
+                report.add("regenerate-config", "ok", argv[2])
+                return
+        raise RecoveryError("GRUB configuration generation failed")
+
+    def _verify(self, plan: RepairPlan, report: RepairReport) -> None:
+        after = self._command(("efibootmgr", "--verbose"), None)
+        if after.returncode != 0:
+            raise RecoveryError("EFI verification failed")
+        lower = after.stdout.lower()
+        if "devil-grub" not in lower:
+            raise RecoveryError("new DEVIL-GRUB EFI entry was not observed")
+        if "windows boot manager" in self._efi_before.lower() and "windows boot manager" not in lower:
+            raise RecoveryError("Windows Boot Manager disappeared during repair")
+        report.add("verify-efi", "ok", "DEVIL-GRUB present; pre-existing Windows entry preserved when detected")
+
+    @staticmethod
+    def _inside_exists(root: Path, path: str) -> bool:
+        return (root / path.lstrip("/")).exists()
+
+    def _run_checked(self, argv: Sequence[str], cwd: Path | None, label: str) -> None:
+        result = self._command(argv, cwd)
+        if result.returncode != 0:
+            raise RecoveryError(f"{label} failed: {result.stderr.strip()}")
+
+    def _cleanup(self, report: RepairReport) -> None:
+        for mountpoint in reversed(self._mounted):
+            result = self._command(("umount", "-R", str(mountpoint)), None)
+            if result.returncode != 0:
+                result = self._command(("umount", str(mountpoint)), None)
+                if result.returncode != 0:
+                    report.warnings.append(f"Could not unmount {mountpoint}: {result.stderr.strip()}")
+        self._mounted.clear()
+        if self._temp_root:
+            try:
+                shutil.rmtree(self._temp_root)
+            except OSError as exc:
+                report.warnings.append(f"Could not remove temporary directory {self._temp_root}: {exc}")
+            self._temp_root = None
