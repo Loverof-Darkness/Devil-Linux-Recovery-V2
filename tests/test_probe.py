@@ -21,12 +21,17 @@ def test_linux_os_release_detection():
     assert ReadOnlyFilesystemProbe._looks_like_linux({"ID": "windows"}) is False
 
 
-def test_probe_linux_uses_existing_mountpoint_without_mounting(tmp_path: Path):
+def test_probe_linux_uses_existing_mountpoint_without_mounting(tmp_path: Path, monkeypatch):
     root = tmp_path / "linux-root"
     (root / "etc").mkdir(parents=True)
     (root / "etc" / "os-release").write_text(
         'ID=garuda\nPRETTY_NAME="Garuda Linux"\n',
         encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        ReadOnlyFilesystemProbe,
+        "_btrfs_root_subvolume",
+        staticmethod(lambda root, filesystem: "@" if root == root.parent / root.name else None),
     )
     probe = ReadOnlyFilesystemProbe()
     part = Partition(device="/dev/sda5", filesystem="btrfs", mountpoint=str(root))
@@ -36,6 +41,7 @@ def test_probe_linux_uses_existing_mountpoint_without_mounting(tmp_path: Path):
     assert system.name == "Garuda Linux"
     assert system.root_device == "/dev/sda5"
     assert system.root_mountpoint == str(root)
+    assert system.root_subvolume == "@"
 
 
 def test_probe_linux_ignores_mounted_data_directory(tmp_path: Path):
