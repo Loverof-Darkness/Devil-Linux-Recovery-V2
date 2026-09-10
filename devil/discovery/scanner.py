@@ -33,6 +33,37 @@ def _mountpoint(raw: Any) -> str | None:
     return raw or None
 
 
+def _normalize_mount_source(source: str) -> str:
+    """Normalize findmnt SOURCE values such as /dev/sda5[/@]."""
+    source = source.strip()
+    if "[" in source and source.endswith("]"):
+        source = source.split("[", 1)[0]
+    return source
+
+
+def _collect_mountpoints(runner: CommandRunner) -> dict[str, str]:
+    """Return device -> mountpoint mappings from the live mount table.
+
+    lsblk is normally authoritative, but mountpoint reporting can be incomplete
+    for Btrfs subvolumes, bind-like mounts, or rapidly changing live systems.
+    findmnt is read-only and gives us a second source of truth.
+    """
+    result = runner.run("findmnt", "-rn", "-o", "SOURCE,TARGET,FSTYPE")
+    if result.returncode != 0:
+        return {}
+
+    mounts: dict[str, str] = {}
+    for line in result.stdout.splitlines():
+        fields = line.split(None, 2)
+        if len(fields) < 2:
+            continue
+        source = _normalize_mount_source(fields[0])
+        target = fields[1]
+        if source.startswith("/dev/") and target.startswith("/"):
+            mounts.setdefault(source, target)
+    return mounts
+
+
 def scan(runner: CommandRunner | None = None, probe: ReadOnlyFilesystemProbe | None = None) -> DiscoverySnapshot:
     runner = runner or CommandRunner()
     probe = probe or ReadOnlyFilesystemProbe()
@@ -40,6 +71,7 @@ def scan(runner: CommandRunner | None = None, probe: ReadOnlyFilesystemProbe | N
 
     nodes = lsblk.collect(runner)
     blkid_map = blkid.collect(runner)
+    live_mounts = _collect_mountpoints(runner)
     flat = _flatten(nodes)
 
     for node in flat:
@@ -53,6 +85,8 @@ def scan(runner: CommandRunner | None = None, probe: ReadOnlyFilesystemProbe | N
             fstype in _EFI_FS
             and (parttype or "").lower() in {"c12a7328-f81f-11d2-ba4b-00a0c93ec93b", "ef00"}
         ) or "esp" in flags
+        lsblk_mountpoint = _mountpoint(node.get("mountpoints") or node.get("mountpoint"))
+        mountpoint = lsblk_mountpoint or live_mounts.get(device)
         partition = Partition(
             device=device,
             parent_disk=node.get("_parent_disk") or node.get("pkname"),
@@ -61,7 +95,7 @@ def scan(runner: CommandRunner | None = None, probe: ReadOnlyFilesystemProbe | N
             label=node.get("label") or blkid_map.get(device, {}).get("LABEL"),
             uuid=node.get("uuid") or blkid_map.get(device, {}).get("UUID"),
             size_bytes=int(node["size"]) if str(node.get("size", "")).isdigit() else None,
-            mountpoint=_mountpoint(node.get("mountpoints") or node.get("mountpoint")),
+            mountpoint=mountpoint,
             partuuid=node.get("partuuid") or blkid_map.get(device, {}).get("PARTUUID"),
             boot="boot" in flags,
             esp=esp,
@@ -78,7 +112,7 @@ def scan(runner: CommandRunner | None = None, probe: ReadOnlyFilesystemProbe | N
     snapshot.efi_entries = efi.collect(runner)
     snapshot.capabilities = {
         name: runner.available(name)
-        for name in ("lsblk", "blkid", "btrfs", "efibootmgr")
+        for name in ("lsblk", "blkid", "findmnt", "btrfs", "efibootmgr")
     }
     snapshot.warnings = [
         f"Missing command: {name}"
