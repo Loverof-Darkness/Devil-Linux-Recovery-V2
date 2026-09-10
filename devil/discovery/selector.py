@@ -21,8 +21,14 @@ def selection_block_reason(system: OperatingSystem) -> str | None:
 
 def render_systems(systems: list[OperatingSystem]) -> str:
     lines = ["Detected Operating Systems", ""]
-    for index, system in enumerate(systems, start=1):
-        lines.append(f"[{index}] {system.name}")
+    linux_number = 0
+    for system in systems:
+        if system.family.lower() == "linux":
+            linux_number += 1
+            prefix = f"[Linux {linux_number}]"
+        else:
+            prefix = f"[{system.family.title()}]"
+        lines.append(f"{prefix} {system.name}")
         lines.append(f"    Family: {system.family}")
         if system.root_device:
             lines.append(f"    Root:   {system.root_device}")
@@ -37,8 +43,12 @@ def render_systems(systems: list[OperatingSystem]) -> str:
         if system.bootloaders:
             lines.append(f"    Boot:   {', '.join(system.bootloaders)}")
         lines.append(f"    Confidence: {system.confidence}")
-        reason = selection_block_reason(system)
-        lines.append("    Status: SAFE CANDIDATE" if reason is None else f"    Status: NOT SAFE TO SELECT ({reason})")
+        reason = selection_block_reason(system) if system.family.lower() == "linux" else None
+        status = "SAFE CANDIDATE" if reason is None else f"NOT SAFE TO SELECT ({reason})"
+        if system.family.lower() == "linux":
+            lines.append(f"    Status: {status}")
+        else:
+            lines.append("    Status: informational only")
         lines.append("")
     return "\n".join(lines).rstrip()
 
