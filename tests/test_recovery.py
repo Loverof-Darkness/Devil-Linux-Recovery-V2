@@ -87,3 +87,38 @@ def test_btrfs_mount_uses_resolved_root_subvolume(tmp_path: Path, monkeypatch):
         "/dev/sda5",
         str(transaction / "root"),
     )
+
+
+def test_preflight_requires_linux_root_and_grub_tools(tmp_path: Path, monkeypatch):
+    target = TargetLayout(
+        os_id="garuda",
+        os_name="Garuda Linux",
+        root_device="/dev/sda5",
+        root_filesystem="btrfs",
+        root_mountpoint="/",
+        root_subvolume="@",
+        boot_device=None,
+        efi_device="/dev/sda1",
+        firmware_mode="uefi",
+        safe=True,
+    )
+    plan = build_repair_plan(target)
+    executor = RecoveryExecutor()
+    root = tmp_path / "root"
+    efi = root / "boot" / "efi"
+    (root / "etc").mkdir(parents=True)
+    (root / "etc" / "os-release").write_text("ID=garuda\n", encoding="utf-8")
+    (root / "usr" / "bin").mkdir(parents=True)
+    (root / "usr" / "bin" / "grub-install").write_text("", encoding="utf-8")
+    (root / "usr" / "bin" / "update-grub").write_text("", encoding="utf-8")
+    efi.mkdir(parents=True)
+    executor._temp_root = tmp_path
+    monkeypatch.setattr(executor, "_mountpoint", lambda path: path == efi)
+
+    details: list[str] = []
+    executor._preflight_target(plan, type("Report", (), {"add": lambda _self, step, status, detail: details.append(detail)})())
+    assert details and "GRUB tooling present" in details[0]
+
+    (root / "usr" / "bin" / "grub-install").unlink()
+    with pytest.raises(RecoveryError, match="grub-install"):
+        executor._preflight_target(plan, type("Report", (), {"add": lambda *args: None})())
