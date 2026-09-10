@@ -61,6 +61,7 @@ def test_scan_builds_linux_and_windows_candidates(monkeypatch) -> None:
     runner = FakeRunner({
         "lsblk": (0, '{"blockdevices": [{"name":"nvme0n1","path":"/dev/nvme0n1","type":"disk","size":1000,"children":[{"name":"nvme0n1p1","path":"/dev/nvme0n1p1","type":"part","fstype":"vfat","parttype":"c12a7328-f81f-11d2-ba4b-00a0c93ec93b","size":512},{"name":"nvme0n1p2","path":"/dev/nvme0n1p2","type":"part","fstype":"ext4","label":"Ubuntu","mountpoints":["/mnt/ubuntu"],"size":900}]}]}', ""),
         "blkid": (0, 'DEVNAME=/dev/nvme0n1p1\nTYPE=vfat\n\nDEVNAME=/dev/nvme0n1p2\nTYPE=ext4\nLABEL=Ubuntu\n\n', ""),
+        "findmnt": (0, "/dev/nvme0n1p2 /mnt/ubuntu ext4\n", ""),
         "efibootmgr": (0, 'Boot0000* ubuntu\tHD(1,GPT,abc)/File(\\EFI\\ubuntu\\shimx64.efi)\nBoot0001  Windows Boot Manager\tHD(1,GPT,abc)/File(\\EFI\\Microsoft\\Boot\\bootmgfw.efi)\n', ""),
         "btrfs": (127, "", "missing"),
     })
@@ -71,6 +72,32 @@ def test_scan_builds_linux_and_windows_candidates(monkeypatch) -> None:
     assert any(item.name == "Ubuntu" for item in snapshot.operating_systems)
     assert any(item.family == "windows" for item in snapshot.operating_systems)
     assert any(item.esp for item in snapshot.partitions)
+
+
+def test_findmnt_fallback_populates_missing_mountpoint(monkeypatch):
+    import devil.discovery.scanner as scanner
+
+    runner = FakeRunner({
+        "lsblk": (0, '{"blockdevices": [{"name":"sda","path":"/dev/sda","type":"disk","size":1000,"children":[{"name":"sda5","path":"/dev/sda5","type":"part","fstype":"btrfs","size":900}]}]}', ""),
+        "blkid": (0, "DEVNAME=/dev/sda5\nTYPE=btrfs\n", ""),
+        "findmnt": (0, "/dev/sda5[/@] / btrfs\n", ""),
+        "efibootmgr": (0, "", ""),
+        "btrfs": (0, "", ""),
+    })
+
+    class MountedRootProbe:
+        def probe_linux(self, partitions, firmware_mode, esp_device):
+            assert any(
+                part.device == "/dev/sda5" and part.mountpoint == "/"
+                for part in partitions
+            )
+            return ProbeResult()
+
+        def probe_windows_efi(self, esp, firmware_mode):
+            return ProbeResult()
+
+    monkeypatch.setattr(scanner.firmware, "detect_firmware", lambda: "uefi")
+    scan(runner, MountedRootProbe())
 
 
 def test_mounted_non_root_filesystem_without_os_release_is_not_linux(tmp_path: Path):
