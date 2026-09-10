@@ -4,27 +4,51 @@
 
 DEVIL V2 is an open-source recovery tool for Linux systems that no longer boot correctly because a bootloader, EFI entry, GRUB configuration, or related boot configuration has been damaged, replaced, or made inaccessible.
 
-The project is designed for one simple recovery experience:
+The target recovery experience is:
 
 ```text
-Boot any suitable Linux Live USB
+Boot a suitable Linux Live USB
         ↓
 Open a terminal
         ↓
-Run one command
+Run the DEVIL launcher
         ↓
-DEVIL downloads and starts
-        ↓
-Detect all installed operating systems
+Discover storage + firmware + boot entries
         ↓
 Choose the Linux installation to repair
         ↓
-Review the proposed repair
+Review the resolved target and repair plan
         ↓
-Confirm
+Confirm explicitly
         ↓
 Repair + verify + report
 ```
+
+## What is implemented
+
+The V2 core now has a complete discovery → target → plan → guarded execution pipeline for its first supported repair class: **UEFI systems using GRUB**.
+
+Implemented capabilities include:
+
+- canonical disk/partition/EFI/OS models
+- read-only firmware, block-device and EFI discovery
+- mounted Linux candidate detection
+- conservative Linux-only target selection
+- EFI System Partition ambiguity detection
+- explainable repair plans with per-step risk labels
+- explicit `REPAIR` confirmation for mutations
+- root-privilege enforcement for actual recovery
+- temporary target mount/chroot lifecycle management
+- EFI backup before GRUB mutation
+- UEFI `grub-install` execution inside the selected Linux installation
+- GRUB configuration regeneration using the target system's own tooling
+- post-repair EFI verification
+- Windows Boot Manager preservation checks when a Windows entry existed before repair
+- structured JSON repair reports
+- dry-run and machine-readable discovery output
+- automated unit tests and CI/release workflows
+
+The executor is intentionally narrow. It does **not** format partitions, unlock encrypted storage automatically, modify Windows BCD, delete unrelated EFI entries, or guess across ambiguous layouts.
 
 ## Why DEVIL exists
 
@@ -32,18 +56,7 @@ Linux boot recovery is powerful but often requires distribution-specific knowled
 
 A mistake in those steps can make a recovery attempt worse.
 
-DEVIL's purpose is to turn that expert workflow into a guided, inspect-first process. The user should select **which operating system** needs repair rather than manually guessing partition names and commands.
-
-### Benefits
-
-- **Accessible recovery:** useful to beginners without hiding the technical work from advanced users.
-- **Multi-boot aware:** identify Linux installations and Windows boot components before proposing a repair.
-- **Safety oriented:** diagnostics are read-only; mutations require an explicit confirmation step.
-- **Transparent:** show the detected target, planned changes, commands, warnings, and results.
-- **Cross-distribution:** build adapters so recovery logic is not tied to one Linux family.
-- **Live-USB friendly:** no permanent installation is required for the recovery session.
-- **Self-contained distribution:** the GitHub project contains the complete source; the bootstrap command retrieves the required release payload automatically.
-- **Auditable:** preserve logs, detected topology, chosen target, repair actions, and verification results.
+DEVIL's purpose is to turn that expert workflow into a guided, inspect-first process. The user selects **which operating system** needs repair rather than manually guessing partition names and commands.
 
 ## Design principles
 
@@ -51,7 +64,7 @@ DEVIL's purpose is to turn that expert workflow into a guided, inspect-first pro
 2. **Never guess a destructive target.** Ambiguous mappings stop the workflow.
 3. **Operate on an operating-system model, not raw partition guesses.**
 4. **Prefer reversible actions and backups where practical.**
-5. **Keep the execution layer close to native Linux tools.**
+5. **Keep execution close to native Linux tools.**
 6. **Make every important decision explainable.**
 7. **Fail closed.** Uncertainty must result in a safe stop, not an aggressive repair.
 
@@ -59,22 +72,103 @@ DEVIL's purpose is to turn that expert workflow into a guided, inspect-first pro
 
 DEVIL V2 uses a mixed Bash + Python design.
 
-- **Bash bootstrap:** must be usable from a normal Linux Live USB terminal and handle download, extraction, launch, and basic environment checks.
-- **Python core:** discovery, normalized system models, repair planning, safety checks, terminal UI, structured logging, and reporting.
-- **Shell adapters:** execute carefully reviewed native operations such as `mount`, `btrfs`, `efibootmgr`, `grub-install`, and GRUB configuration generation.
+```text
+Bash launcher
+    │
+    ▼
+Python CLI
+    │
+    ├── Discovery
+    │     ├── lsblk / blkid
+    │     ├── EFI / firmware
+    │     └── OS candidates
+    │
+    ├── Target resolver
+    │     └── ambiguity + confidence gates
+    │
+    ├── Repair planner
+    │     └── explicit, explainable steps
+    │
+    └── Recovery executor
+          ├── backup
+          ├── mount/chroot
+          ├── GRUB UEFI repair
+          └── verification/report
+```
 
-The guiding boundary is:
+The boundary is deliberate:
 
 ```text
 Python decides and validates.
-Bash/native tools perform approved system operations.
+Native Linux tools perform only approved recovery operations.
 ```
 
-No third-party Python package should be required merely to start the recovery engine. Optional dependencies, when introduced later, must have a clear Live-USB fallback.
+The discovery command adapter has its own allowlist and cannot execute recovery commands. Mutation-capable code lives in the separate `devil.recovery` package.
 
-## Planned detection scope
+## CLI
 
-The initial design targets:
+Read-only diagnosis:
+
+```bash
+python -m devil.cli --diagnose
+```
+
+Machine-readable discovery:
+
+```bash
+python -m devil.cli --json
+```
+
+Resolve a selected Linux target without changing anything:
+
+```bash
+python -m devil.cli --plan
+```
+
+Build the full executable repair plan without changing anything:
+
+```bash
+python -m devil.cli --repair-plan
+```
+
+Execute the supported UEFI GRUB repair interactively:
+
+```bash
+sudo python -m devil.cli --repair --report /tmp/devil-repair.json
+```
+
+For non-interactive automation, `--yes` supplies the exact `REPAIR` confirmation token:
+
+```bash
+sudo python -m devil.cli --repair --yes --report /tmp/devil-repair.json
+```
+
+`--yes` does not bypass target safety checks, firmware checks, root checks, or plan support checks.
+
+## Current recovery behavior
+
+For a supported target the recovery transaction is:
+
+```text
+1. capture current EFI state
+2. mount the selected Linux root read-write
+3. mount separate /boot when explicitly identified
+4. mount the selected EFI System Partition
+5. bind /dev, /proc, /sys and /run into the chroot
+6. back up the EFI tree
+7. run the target system's grub-install for x86_64 UEFI
+8. regenerate GRUB configuration
+9. re-read EFI variables
+10. confirm DEVIL-GRUB exists
+11. confirm an existing Windows Boot Manager entry remains present
+12. unmount temporary filesystems and write a report
+```
+
+The executor uses argument arrays rather than a shell, so user/device strings are not interpolated into shell commands.
+
+## Detection scope
+
+The discovery model is designed to grow toward:
 
 - UEFI and legacy BIOS mode detection
 - EFI System Partitions
@@ -84,79 +178,43 @@ The initial design targets:
 - LUKS awareness without silently unlocking encrypted storage
 - LVM and software RAID awareness
 - Windows Boot Manager detection
-- Multiple Linux installations
-- Existing GRUB installations and configuration locations
-- Firmware boot entries and BootOrder
+- multiple Linux installations
+- existing GRUB installations and configuration locations
+- firmware boot entries and BootOrder
 
-DEVIL must refuse to guess when several targets remain plausible.
+At present, **mounted Linux roots are the conservative automatic OS candidates**. Unmounted filesystem probing, encrypted-root preparation, LVM activation, and RAID assembly are not silently attempted yet. They are explicit future compatibility work, because a Live USB must not assume that every block device can be safely mounted or activated.
 
-## Recovery scope
+## Safety model
 
-The recovery engine is being built incrementally around safe, reviewable operations:
+DEVIL is recovery software, so knowing when **not** to act is a core feature.
 
-- Restore or recreate a Linux EFI boot entry when the mapping is unambiguous
-- Repair/regenerate GRUB configuration for a selected Linux installation
-- Guided GRUB reinstall for supported UEFI layouts
-- Validate BootOrder and restore the selected Linux entry when appropriate
-- Preserve existing Windows boot components rather than modifying Windows BCD
-- Verify the result after each mutation
-- Record a recovery report and command transcript
+The implementation enforces:
 
-Filesystem unlock, LVM activation, RAID assembly, and other environment-specific preparation will remain explicit operations rather than hidden guesses.
+- read-only discovery by default
+- explicit Linux target selection
+- unique root/ESP resolution before mutation
+- medium/high OS confidence before repair planning
+- explicit confirmation before mutation
+- root privilege requirement for recovery
+- EFI backup before GRUB installation
+- cleanup on success and failure
+- verification after mutation
+- no automatic encrypted-volume unlocking
+- no Windows BCD modification
+- no deletion of unrelated EFI entries
+- fail-closed behavior on unsupported firmware or ambiguous target layouts
 
-## User experience goal
+## Live USB bootstrap
 
-Example discovery screen:
-
-```text
-DEVIL Linux Recovery V2
-
-Scanning storage and firmware...
-
-Detected operating systems:
-
-  1. Garuda Linux        Btrfs    /dev/nvme0n1p2
-  2. Ubuntu 24.04        Ext4     /dev/nvme0n1p5
-  3. Windows Boot Manager        EFI
-
-Select the Linux installation to repair [1-3]:
->
-```
-
-Then:
-
-```text
-Repair plan
-
-Target:       Garuda Linux
-Root:         /dev/nvme0n1p2 (Btrfs subvolume @)
-EFI:          /dev/nvme0n1p1
-Firmware:     UEFI
-GRUB target:  x86_64-efi
-
-Planned actions:
-  • create recovery metadata/backup
-  • mount target filesystems
-  • reinstall or repair the Linux EFI loader
-  • regenerate GRUB configuration
-  • verify EFI entry and generated configuration
-
-No Windows files will be modified.
-
-Proceed? [y/N]
-```
-
-## Command-line bootstrap
-
-The public installation experience is intentionally small. A future stable release will provide a one-line bootstrap such as:
+The public launcher is intentionally small. A future stable release can provide a one-line bootstrap such as:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Loverof-Darkness/Devil-Linux-Recovery-V2/main/launcher/devil.sh | bash
 ```
 
-The bootstrap is responsible only for obtaining and launching a verified DEVIL release payload. Recovery logic remains inside the versioned project/release package.
+The bootstrap is responsible only for obtaining and launching a verified DEVIL payload. Recovery logic stays inside the versioned release package.
 
-For development and offline testing, the repository can also be executed directly:
+For development and offline testing:
 
 ```bash
 bash launcher/devil.sh --source
@@ -167,120 +225,74 @@ bash launcher/devil.sh --source
 ```text
 .
 ├── launcher/             # Live-USB bootstrap and local launcher
-├── devil/                # Python application package
-│   ├── cli.py
-│   ├── models/
-│   ├── discovery/       # read-only storage, OS, EFI and firmware discovery
-│   ├── planning/        # read-only target resolution and repair planning
-│   ├── recovery/        # future mutation-capable recovery engine
-│   ├── adapters/        # future reviewed native command adapters
-│   ├── ui/              # future terminal presentation layer
-│   └── reporting/       # future structured recovery reports
-├── scripts/              # Small, reviewable shell operations
-├── tests/                # Unit and safety-focused tests
-├── docs/                 # Architecture, recovery model, safety policy
-├── .github/workflows/    # CI and release automation
-└── pyproject.toml        # Python project metadata and test configuration
+├── devil/
+│   ├── cli.py            # CLI orchestration
+│   ├── models/           # Canonical normalized models
+│   ├── discovery/        # Read-only discovery adapters
+│   ├── planning/         # Target resolution + repair planning
+│   └── recovery/         # Guarded UEFI/GRUB executor + reports
+├── scripts/               # Small, reviewable shell operations
+├── tests/                 # Unit and safety-focused tests
+├── docs/                  # Architecture and safety documentation
+├── .github/workflows/     # CI and release automation
+└── pyproject.toml         # Python package metadata
 ```
 
 ## Development roadmap
 
-### Phase 0 — Foundation
+### V2.1 — Discovery foundation
 
-- Repository structure
-- Bootstrap contract
-- Python package skeleton
-- Normalized data models
-- Logging and error model
-- CI on pushes and pull requests
-- Tagged-release packaging
+- canonical models
+- firmware/block/EFI inventory
+- conservative Linux candidate discovery
+- JSON diagnostics
+- safety-focused selection
 
-### Phase 1 — Read-only discovery
+### V2.2 — Target resolution
 
-- Firmware mode detection
-- Disk/partition inventory
-- Filesystem identification
-- EFI discovery
-- Linux installation discovery
-- Btrfs subvolume discovery
-- Windows boot detection
-- Boot-entry inventory
-- Human-readable and JSON diagnostics
+- unique root resolution
+- EFI ambiguity checks
+- firmware validation
+- explainable target rendering
 
-### Phase 2 — Target selection and repair planning
+### V2.3 — Recovery planning
 
-- Convert raw discovery into OS candidates
-- Confidence scoring and ambiguity detection
-- Explainable repair plans
-- Safety gates
-- Dry-run execution model
+- risk-rated repair steps
+- mutation/read-only boundaries
+- explicit safety gates
+- dry-run plan output
 
-### Phase 3 — Recovery operations
+### V2.4 — First executable recovery class
 
-- EFI entry recovery
-- GRUB configuration recovery
-- Guided UEFI GRUB reinstall
-- Mount/chroot lifecycle management
-- Backups and rollback metadata
-- Post-repair verification
+- UEFI + GRUB executor
+- target mount/chroot lifecycle
+- EFI backup
+- GRUB installation/configuration
+- EFI verification
+- Windows-entry preservation checks
+- structured repair reports
 
-### Phase 4 — Compatibility hardening
+### Next — Compatibility hardening
 
-- Arch/Garuda
-- Debian/Ubuntu/Mint
-- Fedora/RHEL family
-- openSUSE
-- additional supported layouts based on automated test coverage
+- safe unmounted filesystem probing
+- Btrfs subvolume discovery and selection
+- Arch/Garuda layouts
+- Debian/Ubuntu/Mint layouts
+- Fedora/RHEL-family layouts
+- openSUSE layouts
+- LUKS/LVM/RAID preparation as explicit user-approved operations
+- BIOS/legacy GRUB recovery
+- VM-based broken-boot regression lab
+- signed release payloads and stable bootstrap verification
 
-### Phase 5 — Virtual-machine recovery lab
+## Testing philosophy
 
-Build reproducible test scenarios for broken EFI entries, damaged GRUB configuration, multi-boot layouts, Btrfs roots, and common recovery failures. The project should prefer evidence from automated test fixtures over unsupported success-rate claims.
+DEVIL should be tested in two layers:
 
-## Release and deployment model
+1. **Pure unit tests** for parsing, selection, target resolution, plan construction, and executor decision logic.
+2. **Disposable VM scenarios** for real bootloader recovery, including broken EFI entries, missing GRUB configuration, separate /boot, Btrfs, and Windows dual boot.
 
-GitHub Actions will enforce the development and release path:
-
-### Pull requests and pushes
-
-- Python syntax/type/lint checks where configured
-- Unit tests
-- Shell syntax checks
-- Bootstrap smoke tests
-- Package consistency checks
-
-### Version tags
-
-A release tag such as `v2.0.0` will:
-
-1. Run the complete test suite.
-2. Build the portable release archive.
-3. Generate SHA-256 checksums.
-4. Publish GitHub release assets.
-5. Make the release the source of truth for the stable bootstrap payload.
-
-Release automation must never publish an untested build.
-
-## Safety model
-
-DEVIL is recovery software, so correctness includes knowing when **not** to act.
-
-The implementation must enforce:
-
-- read-only discovery by default
-- explicit target selection
-- explicit confirmation before mutation
-- command logging
-- cleanup on success and failure
-- refusal on ambiguous storage mappings
-- no automatic unlocking of encrypted roots
-- no Windows BCD modification
-- no silent deletion of unknown EFI entries
-
-## Project status
-
-**Current stage:** V2.3 — canonical discovery model + read-only target-layout resolution.
-
-The current implementation can inventory discovered storage and firmware state, present Linux candidates, and resolve a selected candidate into a read-only target layout while blocking ambiguous EFI/root mappings. Recovery mutations have not yet been enabled.
+The project should not claim universal compatibility until the relevant layouts have automated coverage.
 
 ## License
 
