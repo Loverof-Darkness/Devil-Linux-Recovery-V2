@@ -52,6 +52,37 @@ def test_build_repair_plan_blocks_unsafe_target():
     assert any("multiple EFI" in reason for reason in plan.reasons)
 
 
+def test_build_repair_plan_blocks_btrfs_without_root_subvolume():
+    from devil.planning.target import resolve_target
+
+    snapshot = safe_target_snapshot()
+    snapshot.partitions[1] = replace(snapshot.partitions[1], filesystem="btrfs")
+    snapshot.operating_systems[0] = replace(
+        snapshot.operating_systems[0],
+        root_subvolume=None,
+    )
+    target = resolve_target(snapshot, "linux-1")
+    plan = build_repair_plan(target)
+    assert plan.safe_to_execute is False
+    assert plan.steps == ()
+    assert any("Btrfs root subvolume" in reason for reason in plan.reasons)
+
+
+def test_build_repair_plan_accepts_btrfs_with_root_subvolume():
+    from devil.planning.target import resolve_target
+
+    snapshot = safe_target_snapshot()
+    snapshot.partitions[1] = replace(snapshot.partitions[1], filesystem="btrfs")
+    snapshot.operating_systems[0] = replace(
+        snapshot.operating_systems[0],
+        root_subvolume="@",
+    )
+    target = resolve_target(snapshot, "linux-1")
+    plan = build_repair_plan(target)
+    assert plan.safe_to_execute is True
+    assert plan.supported is True
+
+
 def test_render_repair_plan_is_explainable():
     from devil.planning.target import resolve_target
 
