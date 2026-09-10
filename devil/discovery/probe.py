@@ -46,9 +46,15 @@ class ReadOnlyFilesystemProbe:
             # An already-mounted filesystem must never be remounted by the
             # discovery path. Inspect its existing mountpoint read-only instead.
             if part.mountpoint:
-                os_release = self._read_os_release(Path(part.mountpoint))
+                mountpoint = Path(part.mountpoint)
+                os_release = self._read_os_release(mountpoint)
                 system = self._system_from_os_release(
-                    part, os_release, firmware_mode, esp_device, root_mountpoint=part.mountpoint
+                    part,
+                    os_release,
+                    firmware_mode,
+                    esp_device,
+                    root_mountpoint=part.mountpoint,
+                    root=mountpoint,
                 )
                 if system is not None:
                     found.append(system)
@@ -88,7 +94,7 @@ class ReadOnlyFilesystemProbe:
             return None
         os_id_value = os_release.get("ID", "linux").lower()
         name = os_release.get("PRETTY_NAME") or os_release.get("NAME") or "Linux"
-        root_subvolume = ReadOnlyFilesystemProbe._btrfs_root_subvolume(root, part.filesystem) if root else None
+        root_subvolume = ReadOnlyFilesystemProbe._btrfs_root_subvolume(root, part.filesystem)
         return OperatingSystem(
             os_id=f"probe-{os_id_value}-{part.uuid or part.device}",
             name=name,
