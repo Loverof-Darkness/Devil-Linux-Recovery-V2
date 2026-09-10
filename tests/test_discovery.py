@@ -104,19 +104,12 @@ def test_physical_live_root_is_detected(monkeypatch):
     import devil.discovery.scanner as scanner
 
     runner = FakeRunner({
-        "lsblk": (0, '{"blockdevices": []}', ""),
-        "blkid": (0, "", ""),
+        "lsblk": (0, '{"blockdevices": [{"name":"sda","path":"/dev/sda","type":"disk","size":1000,"children":[{"name":"sda5","path":"/dev/sda5","type":"part","fstype":"btrfs","mountpoints":["/"],"size":900}]}]}', ""),
+        "blkid": (0, "DEVNAME=/dev/sda5\nTYPE=btrfs\n", ""),
         "findmnt": (0, "/dev/sda5[/@] / btrfs\n", ""),
         "efibootmgr": (0, "", ""),
         "btrfs": (0, "", ""),
     })
-
-    class NoLinuxProbe:
-        def probe_linux(self, partitions, firmware_mode, esp_device):
-            return ProbeResult()
-
-        def probe_windows_efi(self, esp, firmware_mode):
-            return ProbeResult()
 
     def fake_read_text(self, encoding="utf-8", errors="replace"):
         if str(self) == "/etc/os-release":
@@ -126,7 +119,7 @@ def test_physical_live_root_is_detected(monkeypatch):
     monkeypatch.setattr(scanner.firmware, "detect_firmware", lambda: "uefi")
     monkeypatch.setattr(Path, "read_text", fake_read_text)
 
-    snapshot = scan(runner, NoLinuxProbe())
+    snapshot = scan(runner, ReadOnlyFilesystemProbe())
     linux = [item for item in snapshot.operating_systems if item.family == "linux"]
     assert len(linux) == 1
     assert linux[0].name == "Garuda Linux"
