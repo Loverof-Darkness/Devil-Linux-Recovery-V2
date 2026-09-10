@@ -23,10 +23,11 @@ class FoundationTests(unittest.TestCase):
             name="Garuda Linux",
             family="Linux",
             root_device="/dev/nvme0n1p2",
-            root_filesystem="btrfs",
+            root_subvolume="@",
             confidence="high",
         )
-        self.assertTrue(os_record.is_linux())
+        self.assertEqual(os_record.family.lower(), "linux")
+        self.assertEqual(os_record.root_subvolume, "@")
 
 
 if __name__ == "__main__":
