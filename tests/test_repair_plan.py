@@ -1,3 +1,5 @@
+from dataclasses import replace
+
 from devil.models.discovery import DiscoverySnapshot, OperatingSystem, Partition
 from devil.planning.repair import build_repair_plan, render_repair_plan
 
@@ -33,6 +35,7 @@ def test_build_repair_plan_has_guarded_steps():
     assert plan.safe_to_execute is True
     assert plan.steps[0].step_id == "capture-state"
     assert any(step.step_id == "install-grub" and step.risk == "HIGH" for step in plan.steps)
+    assert any(step.step_id == "promote-bootorder" and step.risk == "HIGH" for step in plan.steps)
     assert plan.steps[-1].mutates_system is False
 
 
@@ -40,6 +43,7 @@ def test_build_repair_plan_blocks_unsafe_target():
     from devil.planning.target import resolve_target
 
     snapshot = safe_target_snapshot()
+    snapshot.operating_systems[0] = replace(snapshot.operating_systems[0], efi_device=None)
     snapshot.partitions.append(Partition(device="/dev/sdb1", filesystem="vfat", esp=True))
     target = resolve_target(snapshot, "linux-1")
     plan = build_repair_plan(target)
