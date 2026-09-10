@@ -100,6 +100,41 @@ def test_findmnt_fallback_populates_missing_mountpoint(monkeypatch):
     scan(runner, MountedRootProbe())
 
 
+def test_physical_live_root_is_detected(monkeypatch):
+    import devil.discovery.scanner as scanner
+
+    runner = FakeRunner({
+        "lsblk": (0, '{"blockdevices": []}', ""),
+        "blkid": (0, "", ""),
+        "findmnt": (0, "/dev/sda5[/@] / btrfs\n", ""),
+        "efibootmgr": (0, "", ""),
+        "btrfs": (0, "", ""),
+    })
+
+    class NoLinuxProbe:
+        def probe_linux(self, partitions, firmware_mode, esp_device):
+            return ProbeResult()
+
+        def probe_windows_efi(self, esp, firmware_mode):
+            return ProbeResult()
+
+    def fake_read_text(self, encoding="utf-8", errors="replace"):
+        if str(self) == "/etc/os-release":
+            return 'ID=garuda\nNAME="Garuda Linux"\nPRETTY_NAME="Garuda Linux"\n'
+        raise FileNotFoundError(str(self))
+
+    monkeypatch.setattr(scanner.firmware, "detect_firmware", lambda: "uefi")
+    monkeypatch.setattr(Path, "read_text", fake_read_text)
+
+    snapshot = scan(runner, NoLinuxProbe())
+    linux = [item for item in snapshot.operating_systems if item.family == "linux"]
+    assert len(linux) == 1
+    assert linux[0].name == "Garuda Linux"
+    assert linux[0].root_device == "/dev/sda5"
+    assert linux[0].root_mountpoint == "/"
+    assert linux[0].confidence == "high"
+
+
 def test_mounted_non_root_filesystem_without_os_release_is_not_linux(tmp_path: Path):
     part = Partition(device="/dev/sda5", filesystem="ext4", mountpoint=str(tmp_path), label="data")
     result = ReadOnlyFilesystemProbe._system_from_os_release(
