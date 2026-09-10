@@ -19,6 +19,16 @@ class FakeRunner(CommandRunner):
         return CommandResult(rc, stdout, stderr)
 
 
+class NoopProbe:
+    def probe_linux(self, partitions, firmware_mode, esp_device):
+        from devil.discovery.probe import ProbeResult
+        return ProbeResult()
+
+    def probe_windows_efi(self, esp, firmware_mode):
+        from devil.discovery.probe import ProbeResult
+        return ProbeResult()
+
+
 def test_efi_parser_extracts_entries() -> None:
     runner = FakeRunner({
         "efibootmgr": (0, "Boot0000* ubuntu\tHD(1,GPT,abc)/File(\\EFI\\ubuntu\\shimx64.efi)\nBoot0001  Windows Boot Manager\tHD(1,GPT,abc)/File(\\EFI\\Microsoft\\Boot\\bootmgfw.efi)\n", "")
@@ -41,7 +51,7 @@ def test_scan_builds_linux_and_windows_candidates(monkeypatch) -> None:
         "btrfs": (127, "", "missing"),
     })
 
-    snapshot = scan(runner)
+    snapshot = scan(runner, NoopProbe())
     assert isinstance(snapshot, DiscoverySnapshot)
     assert snapshot.firmware_mode == "uefi"
     assert any(item.name == "Ubuntu" for item in snapshot.operating_systems)
