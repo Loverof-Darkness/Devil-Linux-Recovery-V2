@@ -7,9 +7,9 @@ Usage:
   recovery-lab.sh --check
   recovery-lab.sh --run <qcow2-or-raw-disk>
 
-The lab is intentionally disposable. --run always starts QEMU with -snapshot,
-so guest writes are discarded when the VM exits. No host block device may be
-passed directly; the argument must be a regular file.
+The lab is intentionally disposable. --run always starts QEMU with snapshot
+mode, so guest writes are discarded when the VM exits. No host block device
+may be passed directly; the argument must be a regular file.
 EOF
 }
 
@@ -17,9 +17,6 @@ fail() {
     printf 'recovery-lab: ERROR: %s\n' "$*" >&2
     exit 2
 }
-
-command -v qemu-system-x86_64 >/dev/null 2>&1 || QEMU=''
-QEMU=${QEMU:-qemu-system-x86_64}
 
 find_ovmf() {
     local candidate
@@ -68,12 +65,22 @@ run_lab() {
         /dev/*|/sys/*|/proc/*|/run/*) fail "refusing non-file storage path: $disk" ;;
     esac
 
-    local ovmf
-    ovmf=$(find_ovmf) || fail "OVMF UEFI firmware not found"
     command -v qemu-system-x86_64 >/dev/null 2>&1 || fail "qemu-system-x86_64 not found"
+    command -v qemu-img >/dev/null 2>&1 || fail "qemu-img not found"
+
+    local ovmf format
+    ovmf=$(find_ovmf) || fail "OVMF UEFI firmware not found"
+    format=$(qemu-img info "$disk" | awk -F: '/^file format:/ {gsub(/^[[:space:]]+|[[:space:]]+$/, "", $2); print $2; exit}')
+    [[ -n "$format" ]] || fail "could not determine disk image format"
+
+    case "$format" in
+        qcow2|raw) ;;
+        *) fail "unsupported guest image format: $format (expected qcow2 or raw)" ;;
+    esac
 
     printf 'recovery-lab: launching disposable UEFI VM\n'
     printf 'recovery-lab: disk image: %s\n' "$disk"
+    printf 'recovery-lab: format:     %s\n' "$format"
     printf 'recovery-lab: snapshot:   enabled (guest writes discarded)\n'
 
     exec qemu-system-x86_64 \
@@ -82,7 +89,7 @@ run_lab() {
         -m 4096 \
         -smp 2 \
         -bios "$ovmf" \
-        -drive "file=$disk,format=qcow2,if=virtio,snapshot=on" \
+        -drive "file=$disk,format=$format,if=virtio,snapshot=on" \
         -boot menu=on \
         -display gtk \
         -serial mon:stdio
