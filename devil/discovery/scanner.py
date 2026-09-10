@@ -34,18 +34,34 @@ def _mountpoint(raw: Any) -> str | None:
 
 
 def _normalize_mount_source(source: str) -> str:
-    """Normalize findmnt SOURCE values such as /dev/sda5[/@]."""
+    """Normalize findmnt SOURCE values, including Btrfs subvolume notation."""
     source = source.strip()
     if "[" in source and source.endswith("]"):
         source = source.split("[", 1)[0]
     return source
 
 
-def _collect_mountpoints(runner: CommandRunner) -> dict[str, str]:
+def _source_aliases(source: str, flat: list[dict[str, Any]]) -> set[str]:
+    """Return equivalent source spellings used by lsblk and findmnt."""
+    normalized = _normalize_mount_source(source)
+    aliases = {normalized}
+    for node in flat:
+        path = str(node.get("path") or node.get("name") or "")
+        if not path:
+            continue
+        node_path = _normalize_mount_source(path)
+        if node_path == normalized:
+            aliases.add(path)
+        if path.startswith("/dev/") and path.rsplit("/", 1)[-1] == normalized.rsplit("/", 1)[-1]:
+            aliases.add(path)
+    return aliases
+
+
+def _collect_mountpoints(runner: CommandRunner, flat: list[dict[str, Any]]) -> dict[str, str]:
     """Return device -> mountpoint mappings from the live mount table.
 
     lsblk is normally authoritative, but mountpoint reporting can be incomplete
-    for Btrfs subvolumes, bind-like mounts, or rapidly changing live systems.
+    for Btrfs subvolumes, mapper devices, or rapidly changing live systems.
     findmnt is read-only and gives us a second source of truth.
     """
     result = runner.run("findmnt", "-rn", "-o", "SOURCE,TARGET,FSTYPE")
@@ -59,8 +75,10 @@ def _collect_mountpoints(runner: CommandRunner) -> dict[str, str]:
             continue
         source = _normalize_mount_source(fields[0])
         target = fields[1]
-        if source.startswith("/dev/") and target.startswith("/"):
-            mounts.setdefault(source, target)
+        if not source.startswith("/") or not target.startswith("/"):
+            continue
+        for alias in _source_aliases(source, flat):
+            mounts.setdefault(alias, target)
     return mounts
 
 
@@ -71,8 +89,8 @@ def scan(runner: CommandRunner | None = None, probe: ReadOnlyFilesystemProbe | N
 
     nodes = lsblk.collect(runner)
     blkid_map = blkid.collect(runner)
-    live_mounts = _collect_mountpoints(runner)
     flat = _flatten(nodes)
+    live_mounts = _collect_mountpoints(runner, flat)
 
     for node in flat:
         device = node.get("path") or node.get("name")
@@ -86,7 +104,7 @@ def scan(runner: CommandRunner | None = None, probe: ReadOnlyFilesystemProbe | N
             and (parttype or "").lower() in {"c12a7328-f81f-11d2-ba4b-00a0c93ec93b", "ef00"}
         ) or "esp" in flags
         lsblk_mountpoint = _mountpoint(node.get("mountpoints") or node.get("mountpoint"))
-        mountpoint = lsblk_mountpoint or live_mounts.get(device)
+        mountpoint = lsblk_mountpoint or live_mounts.get(device) or live_mounts.get(_normalize_mount_source(device))
         partition = Partition(
             device=device,
             parent_disk=node.get("_parent_disk") or node.get("pkname"),
@@ -123,8 +141,6 @@ def scan(runner: CommandRunner | None = None, probe: ReadOnlyFilesystemProbe | N
     esp_parts = [p for p in snapshot.partitions if p.esp]
     unique_efi_device = esp_parts[0].device if len(esp_parts) == 1 else None
 
-    # Identify Linux roots from actual filesystem evidence. This works for both
-    # already-mounted installations and unmounted installations in a Live USB.
     result = probe.probe_linux(snapshot.partitions, snapshot.firmware_mode, unique_efi_device)
     seen_linux_devices: set[str] = set()
     for system in result.operating_systems:
@@ -133,8 +149,6 @@ def scan(runner: CommandRunner | None = None, probe: ReadOnlyFilesystemProbe | N
             seen_linux_devices.add(system.root_device)
     snapshot.warnings.extend(result.warnings)
 
-    # Probe every discovered ESP for the actual Microsoft loader. Multiple ESPs
-    # remain ambiguous for repair, but their evidence is still useful.
     windows_found = False
     for esp in esp_parts:
         windows_probe = probe.probe_windows_efi(esp, snapshot.firmware_mode)
@@ -144,8 +158,6 @@ def scan(runner: CommandRunner | None = None, probe: ReadOnlyFilesystemProbe | N
                 windows_found = True
         snapshot.warnings.extend(windows_probe.warnings)
 
-    # Firmware entries provide additional Windows evidence if the ESP cannot
-    # currently be inspected.
     windows_entry_names = tuple(
         entry.label for entry in snapshot.efi_entries if "windows" in entry.label.lower()
     )
