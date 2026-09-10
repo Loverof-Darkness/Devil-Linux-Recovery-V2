@@ -14,8 +14,6 @@ def selectable_linux(systems: list[OperatingSystem]) -> list[OperatingSystem]:
 def selection_block_reason(system: OperatingSystem) -> str | None:
     if not system.root_device:
         return "missing root device"
-    if not system.root_mountpoint:
-        return "missing root mountpoint"
     if _CONFIDENCE_RANK.get(system.confidence.lower(), 0) < _CONFIDENCE_RANK["medium"]:
         return "identification confidence is too low"
     return None
@@ -30,6 +28,8 @@ def render_systems(systems: list[OperatingSystem]) -> str:
             lines.append(f"    Root:   {system.root_device}")
         if system.root_mountpoint:
             lines.append(f"    Mount:  {system.root_mountpoint}")
+        else:
+            lines.append("    Mount:  not currently mounted")
         if system.root_subvolume:
             lines.append(f"    Subvol: {system.root_subvolume}")
         if system.efi_device:
