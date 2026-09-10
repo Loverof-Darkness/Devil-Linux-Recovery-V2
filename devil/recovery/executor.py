@@ -77,6 +77,7 @@ class RecoveryExecutor:
             self._require_tools()
             self._capture_state(report)
             self._mount_target(plan, report)
+            self._preflight_target(plan, report)
             self._backup_efi(report)
             self._install_grub(report)
             self._promote_boot_order(report)
@@ -111,7 +112,7 @@ class RecoveryExecutor:
             raise RecoveryError("explicit confirmation token REPAIR is required")
 
     def _require_tools(self) -> None:
-        required = ("mount", "umount", "chroot", "efibootmgr", "tar")
+        required = ("mount", "umount", "chroot", "efibootmgr", "tar", "mountpoint")
         missing = [tool for tool in required if shutil.which(tool) is None]
         if missing:
             raise RecoveryError("missing required host tools: " + ", ".join(missing))
@@ -168,6 +169,54 @@ class RecoveryExecutor:
             )
             self._mounted.append(destination)
         report.add("mount-target", "ok", f"mounted target under {root}")
+
+    def _preflight_target(self, plan: RepairPlan, report: RepairReport) -> None:
+        assert self._temp_root is not None
+        root = self._temp_root / "root"
+        efi = root / "boot" / "efi"
+
+        if not (root / "etc" / "os-release").is_file():
+            raise RecoveryError("mounted target does not contain /etc/os-release")
+        if not self._mountpoint(efi):
+            raise RecoveryError("selected EFI device is not mounted at target /boot/efi")
+
+        grub_install = next(
+            (path for path in ("/usr/sbin/grub-install", "/usr/bin/grub-install") if self._inside_exists(root, path)),
+            None,
+        )
+        if grub_install is None:
+            raise RecoveryError("target installation does not contain grub-install; refusing UEFI GRUB repair")
+
+        generator = next(
+            (
+                path
+                for path in (
+                    "/usr/sbin/update-grub",
+                    "/usr/bin/update-grub",
+                    "/usr/sbin/grub-mkconfig",
+                    "/usr/bin/grub-mkconfig",
+                    "/usr/sbin/grub2-mkconfig",
+                    "/usr/bin/grub2-mkconfig",
+                )
+                if self._inside_exists(root, path)
+            ),
+            None,
+        )
+        if generator is None:
+            raise RecoveryError("target installation does not contain a GRUB configuration generator")
+
+        if plan.target.root_filesystem and plan.target.root_filesystem.lower() == "btrfs" and not plan.target.root_subvolume:
+            raise RecoveryError("Btrfs target root subvolume is unresolved")
+
+        report.add(
+            "preflight",
+            "ok",
+            f"target root verified; EFI mounted; GRUB tooling present ({grub_install}, {generator})",
+        )
+
+    def _mountpoint(self, path: Path) -> bool:
+        result = self._command(("mountpoint", "-q", str(path)), None)
+        return result.returncode == 0
 
     def _backup_efi(self, report: RepairReport) -> None:
         assert self._temp_root is not None
