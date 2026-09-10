@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -78,6 +79,7 @@ class RecoveryExecutor:
             self._mount_target(plan, report)
             self._backup_efi(report)
             self._install_grub(report)
+            self._promote_boot_order(report)
             self._regenerate_config(report)
             self._verify(report)
             report.success = True
@@ -101,6 +103,8 @@ class RecoveryExecutor:
             raise RecoveryError("only UEFI recovery is currently executable")
         if not plan.target.root_device or not plan.target.efi_device:
             raise RecoveryError("target root and EFI devices are required")
+        if not plan.target.efi_device.startswith("/dev/") or not plan.target.root_device.startswith("/dev/"):
+            raise RecoveryError("target devices must be absolute /dev paths")
         if os.geteuid() != 0:
             raise RecoveryError("recovery execution requires root privileges")
         if confirmation.strip() != "REPAIR":
@@ -124,12 +128,14 @@ class RecoveryExecutor:
         root = self._temp_root / "root"
         root.mkdir()
 
-        mount_args = ["mount", "-o", "rw"]
-        fs = (plan.target.root_filesystem or "").lower()
-        if fs == "btrfs" and plan.target.root_subvolume:
-            mount_args[-1] = "rw,subvol=" + plan.target.root_subvolume
-        mount_args.extend([plan.target.root_device, str(root)])
-        self._run_checked(mount_args, "mount Linux root")
+        if plan.target.root_filesystem and plan.target.root_filesystem.lower() == "btrfs" and plan.target.root_subvolume:
+            root_options = f"rw,subvol={plan.target.root_subvolume}"
+        else:
+            root_options = "rw"
+        self._run_checked(
+            ("mount", "-o", root_options, plan.target.root_device, str(root)),
+            "mount Linux root",
+        )
         self._mounted.append(root)
 
         boot_target = root / "boot"
@@ -185,11 +191,7 @@ class RecoveryExecutor:
     def _install_grub(self, report: RepairReport) -> None:
         assert self._temp_root is not None
         root = self._temp_root / "root"
-        commands = (
-            ("/usr/sbin/grub-install", "grub-install"),
-            ("/usr/bin/grub-install", "grub-install"),
-        )
-        for inside_path, label in commands:
+        for inside_path in ("/usr/sbin/grub-install", "/usr/bin/grub-install"):
             if not self._inside_exists(root, inside_path):
                 continue
             result = self._command(
@@ -205,11 +207,32 @@ class RecoveryExecutor:
                 None,
             )
             if result.returncode == 0:
-                report.add("install-grub", "ok", f"installed UEFI loader DEVIL-GRUB via {label}")
+                report.add("install-grub", "ok", f"installed UEFI loader DEVIL-GRUB via {inside_path}")
                 return
             detail = result.stderr.strip() or result.stdout.strip()
             raise RecoveryError(f"GRUB installation failed: {detail}")
         raise RecoveryError("target installation does not contain grub-install")
+
+    def _promote_boot_order(self, report: RepairReport) -> None:
+        result = self._command(("efibootmgr", "--verbose"), None)
+        if result.returncode != 0:
+            raise RecoveryError(f"EFI entry read failed after GRUB installation: {result.stderr.strip()}")
+        match = re.search(r"^Boot([0-9A-Fa-f]{4})[ *]+DEVIL-GRUB(?:\s|$)", result.stdout, re.MULTILINE | re.IGNORECASE)
+        if not match:
+            raise RecoveryError("DEVIL-GRUB EFI entry was not found after installation")
+        devil_number = match.group(1).upper()
+        order_match = re.search(r"^BootOrder:\s*([0-9A-Fa-f,]+)", result.stdout, re.MULTILINE)
+        if not order_match:
+            raise RecoveryError("firmware BootOrder was not reported")
+        current = [item.upper() for item in order_match.group(1).split(",") if item]
+        new_order = [devil_number] + [item for item in current if item != devil_number]
+        if current == new_order:
+            report.add("promote-bootorder", "ok", f"DEVIL-GRUB {devil_number} was already first")
+            return
+        set_result = self._command(("efibootmgr", "-o", ",".join(new_order)), None)
+        if set_result.returncode != 0:
+            raise RecoveryError(f"BootOrder update failed: {set_result.stderr.strip()}")
+        report.add("promote-bootorder", "ok", f"BootOrder set to {','.join(new_order)}")
 
     def _regenerate_config(self, report: RepairReport) -> None:
         assert self._temp_root is not None
@@ -248,10 +271,14 @@ class RecoveryExecutor:
             raise RecoveryError("new DEVIL-GRUB EFI entry was not observed")
         if "windows boot manager" in self._efi_before.lower() and "windows boot manager" not in lower:
             raise RecoveryError("Windows Boot Manager disappeared during repair")
+        order_match = re.search(r"^BootOrder:\s*([0-9A-Fa-f,]+)", after.stdout, re.MULTILINE)
+        devil_match = re.search(r"^Boot([0-9A-Fa-f]{4})[ *]+DEVIL-GRUB(?:\s|$)", after.stdout, re.MULTILINE | re.IGNORECASE)
+        if not order_match or not devil_match or order_match.group(1).split(",")[0].upper() != devil_match.group(1).upper():
+            raise RecoveryError("DEVIL-GRUB is not first in firmware BootOrder after repair")
         report.add(
             "verify-efi",
             "ok",
-            "DEVIL-GRUB present; pre-existing Windows entry preserved when detected",
+            "DEVIL-GRUB present and first in BootOrder; pre-existing Windows entry preserved when detected",
         )
 
     @staticmethod
