@@ -28,10 +28,17 @@ def test_probe_linux_uses_existing_mountpoint_without_mounting(tmp_path: Path, m
         'ID=garuda\nPRETTY_NAME="Garuda Linux"\n',
         encoding="utf-8",
     )
+    observed: dict[str, object] = {}
+
+    def fake_subvolume(mount_root, filesystem):
+        observed["root"] = mount_root
+        observed["filesystem"] = filesystem
+        return "@"
+
     monkeypatch.setattr(
         ReadOnlyFilesystemProbe,
         "_btrfs_root_subvolume",
-        staticmethod(lambda root, filesystem: "@" if root == root.parent / root.name else None),
+        staticmethod(fake_subvolume),
     )
     probe = ReadOnlyFilesystemProbe()
     part = Partition(device="/dev/sda5", filesystem="btrfs", mountpoint=str(root))
@@ -42,6 +49,7 @@ def test_probe_linux_uses_existing_mountpoint_without_mounting(tmp_path: Path, m
     assert system.root_device == "/dev/sda5"
     assert system.root_mountpoint == str(root)
     assert system.root_subvolume == "@"
+    assert observed == {"root": root, "filesystem": "btrfs"}
 
 
 def test_probe_linux_ignores_mounted_data_directory(tmp_path: Path):
