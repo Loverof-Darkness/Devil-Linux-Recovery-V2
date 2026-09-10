@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 from devil.discovery import blkid, efi, firmware, lsblk
@@ -58,12 +59,7 @@ def _source_aliases(source: str, flat: list[dict[str, Any]]) -> set[str]:
 
 
 def _collect_mountpoints(runner: CommandRunner, flat: list[dict[str, Any]]) -> dict[str, str]:
-    """Return device -> mountpoint mappings from the live mount table.
-
-    lsblk is normally authoritative, but mountpoint reporting can be incomplete
-    for Btrfs subvolumes, mapper devices, or rapidly changing live systems.
-    findmnt is read-only and gives us a second source of truth.
-    """
+    """Return device -> mountpoint mappings from the live mount table."""
     result = runner.run("findmnt", "-rn", "-o", "SOURCE,TARGET,FSTYPE")
     if result.returncode != 0:
         return {}
@@ -80,6 +76,36 @@ def _collect_mountpoints(runner: CommandRunner, flat: list[dict[str, Any]]) -> d
         for alias in _source_aliases(source, flat):
             mounts.setdefault(alias, target)
     return mounts
+
+
+def _collect_root_mount(runner: CommandRunner) -> tuple[str, str] | None:
+    """Return the physical source and filesystem for the live `/` mount."""
+    result = runner.run("findmnt", "-rn", "-o", "SOURCE,FSTYPE", "/")
+    if result.returncode != 0:
+        return None
+    fields = result.stdout.strip().split(None, 1)
+    if len(fields) != 2:
+        return None
+    source = _normalize_mount_source(fields[0])
+    filesystem = fields[1].strip().lower()
+    if not source.startswith("/dev/") or filesystem not in _LINUX_FS:
+        return None
+    return source, filesystem
+
+
+def _os_release_from_root(root: Path) -> dict[str, str]:
+    try:
+        text = (root / "etc" / "os-release").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return {}
+    data: dict[str, str] = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        data[key] = value.strip().strip('"').strip("'")
+    return data
 
 
 def scan(runner: CommandRunner | None = None, probe: ReadOnlyFilesystemProbe | None = None) -> DiscoverySnapshot:
@@ -127,6 +153,40 @@ def scan(runner: CommandRunner | None = None, probe: ReadOnlyFilesystemProbe | N
                 "serial": node.get("serial"),
             })
 
+    # The live root deserves an explicit path because it is the strongest
+    # available mounted-Linux signal and can be represented differently by
+    # lsblk/findmnt on Btrfs systems. It is only trusted when findmnt reports
+    # a physical /dev source with a known Linux filesystem.
+    root_mount = _collect_root_mount(runner)
+    if root_mount:
+        root_device, root_filesystem = root_mount
+        matching = next((p for p in snapshot.partitions if _normalize_mount_source(p.device) == root_device), None)
+        if matching is None:
+            snapshot.partitions.append(
+                Partition(
+                    device=root_device,
+                    filesystem=root_filesystem,
+                    mountpoint="/",
+                )
+            )
+        elif matching.mountpoint != "/":
+            snapshot.partitions = [
+                Partition(
+                    device=p.device,
+                    parent_disk=p.parent_disk,
+                    part_type=p.part_type,
+                    filesystem=p.filesystem,
+                    label=p.label,
+                    uuid=p.uuid,
+                    size_bytes=p.size_bytes,
+                    mountpoint="/" if _normalize_mount_source(p.device) == root_device else p.mountpoint,
+                    partuuid=p.partuuid,
+                    boot=p.boot,
+                    esp=p.esp,
+                )
+                for p in snapshot.partitions
+            ]
+
     snapshot.efi_entries = efi.collect(runner)
     snapshot.capabilities = {
         name: runner.available(name)
@@ -148,6 +208,27 @@ def scan(runner: CommandRunner | None = None, probe: ReadOnlyFilesystemProbe | N
             snapshot.operating_systems.append(system)
             seen_linux_devices.add(system.root_device)
     snapshot.warnings.extend(result.warnings)
+
+    # Explicitly inspect the physical live root when it was not discovered by
+    # the general partition probe. This does not mount or modify anything.
+    if root_mount and not any(item.family.lower() == "linux" and item.root_mountpoint == "/" for item in snapshot.operating_systems):
+        root_device, root_filesystem = root_mount
+        os_release = _os_release_from_root(Path("/"))
+        if os_release and ReadOnlyFilesystemProbe._looks_like_linux(os_release):
+            os_id_value = os_release.get("ID", "linux").lower()
+            name = os_release.get("PRETTY_NAME") or os_release.get("NAME") or "Linux"
+            snapshot.operating_systems.append(
+                OperatingSystem(
+                    os_id=f"live-root-{os_id_value}-{root_device}",
+                    name=name,
+                    family="linux",
+                    root_device=root_device,
+                    root_mountpoint="/",
+                    efi_device=unique_efi_device,
+                    firmware_mode=snapshot.firmware_mode,
+                    confidence="high",
+                )
+            )
 
     windows_found = False
     for esp in esp_parts:
