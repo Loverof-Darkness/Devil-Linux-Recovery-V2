@@ -3,7 +3,8 @@ from __future__ import annotations
 from devil.discovery.commands import CommandResult, CommandRunner
 from devil.discovery import efi
 from devil.discovery.scanner import scan
-from devil.models.discovery import DiscoverySnapshot
+from devil.models.discovery import DiscoverySnapshot, OperatingSystem
+from devil.discovery.probe import ProbeResult
 
 
 class FakeRunner(CommandRunner):
@@ -19,13 +20,24 @@ class FakeRunner(CommandRunner):
         return CommandResult(rc, stdout, stderr)
 
 
-class NoopProbe:
+class FixtureProbe:
     def probe_linux(self, partitions, firmware_mode, esp_device):
-        from devil.discovery.probe import ProbeResult
-        return ProbeResult()
+        return ProbeResult(
+            operating_systems=(
+                OperatingSystem(
+                    os_id="fixture-linux",
+                    name="Ubuntu",
+                    family="linux",
+                    root_device="/dev/nvme0n1p2",
+                    root_mountpoint="/mnt/ubuntu",
+                    efi_device=esp_device,
+                    firmware_mode=firmware_mode,
+                    confidence="high",
+                ),
+            )
+        )
 
     def probe_windows_efi(self, esp, firmware_mode):
-        from devil.discovery.probe import ProbeResult
         return ProbeResult()
 
 
@@ -51,9 +63,20 @@ def test_scan_builds_linux_and_windows_candidates(monkeypatch) -> None:
         "btrfs": (127, "", "missing"),
     })
 
-    snapshot = scan(runner, NoopProbe())
+    snapshot = scan(runner, FixtureProbe())
     assert isinstance(snapshot, DiscoverySnapshot)
     assert snapshot.firmware_mode == "uefi"
     assert any(item.name == "Ubuntu" for item in snapshot.operating_systems)
     assert any(item.family == "windows" for item in snapshot.operating_systems)
     assert any(item.esp for item in snapshot.partitions)
+
+
+def test_mounted_non_root_filesystem_without_os_release_is_not_linux():
+    from devil.discovery.probe import ReadOnlyFilesystemProbe
+    from devil.models.discovery import Partition
+
+    part = Partition(device="/dev/sda5", filesystem="ext4", mountpoint="/var/tmp", label="data")
+    result = ReadOnlyFilesystemProbe._identify_linux_root(
+        __import__("pathlib").Path("/var/tmp"), part, "uefi", "/dev/sda1"
+    )
+    assert result is None
