@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 from devil.discovery.commands import CommandResult, CommandRunner
 from devil.discovery import efi
 from devil.discovery.scanner import scan
-from devil.models.discovery import DiscoverySnapshot, OperatingSystem
-from devil.discovery.probe import ProbeResult
+from devil.discovery.probe import ProbeResult, ReadOnlyFilesystemProbe
+from devil.models.discovery import DiscoverySnapshot, OperatingSystem, Partition
 
 
 class FakeRunner(CommandRunner):
@@ -71,12 +73,7 @@ def test_scan_builds_linux_and_windows_candidates(monkeypatch) -> None:
     assert any(item.esp for item in snapshot.partitions)
 
 
-def test_mounted_non_root_filesystem_without_os_release_is_not_linux():
-    from devil.discovery.probe import ReadOnlyFilesystemProbe
-    from devil.models.discovery import Partition
-
-    part = Partition(device="/dev/sda5", filesystem="ext4", mountpoint="/var/tmp", label="data")
-    result = ReadOnlyFilesystemProbe._identify_linux_root(
-        __import__("pathlib").Path("/var/tmp"), part, "uefi", "/dev/sda1"
-    )
+def test_mounted_non_root_filesystem_without_os_release_is_not_linux(tmp_path: Path):
+    part = Partition(device="/dev/sda5", filesystem="ext4", mountpoint=str(tmp_path), label="data")
+    result = ReadOnlyFilesystemProbe._identify_linux_root(tmp_path, part, "uefi", "/dev/sda1")
     assert result is None
