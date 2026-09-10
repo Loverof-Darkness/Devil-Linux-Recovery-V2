@@ -1,7 +1,7 @@
 """Guarded executor for the first real DEVIL repair workflow.
 
 The executor is deliberately narrow: UEFI + GRUB only, a previously resolved
-safe target, explicit confirmation, and transactional cleanup.  It never
+safe target, explicit confirmation, and transactional cleanup. It never
 formats partitions, deletes EFI files, edits Windows loaders, or uses a shell.
 """
 from __future__ import annotations
@@ -49,6 +49,7 @@ class RecoveryExecutor:
         self._command = command or self._run
         self._mounted: list[Path] = []
         self._temp_root: Path | None = None
+        self._efi_before = ""
 
     @staticmethod
     def _run(argv: Sequence[str], cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
@@ -61,7 +62,13 @@ class RecoveryExecutor:
             timeout=120,
         )
 
-    def execute(self, plan: RepairPlan, *, confirmation: str = "", report_path: str | None = None) -> RepairReport:
+    def execute(
+        self,
+        plan: RepairPlan,
+        *,
+        confirmation: str = "",
+        report_path: str | None = None,
+    ) -> RepairReport:
         self._validate(plan, confirmation)
         started = datetime.now(timezone.utc).isoformat()
         report = RepairReport(started_at=started, target_os=plan.target.os_name)
@@ -69,11 +76,10 @@ class RecoveryExecutor:
             self._require_tools()
             self._capture_state(report)
             self._mount_target(plan, report)
-            backup_dir = self._backup_efi(report)
-            self._install_grub(plan, report)
+            self._backup_efi(report)
+            self._install_grub(report)
             self._regenerate_config(report)
-            self._verify(plan, report)
-            report.add("cleanup", "ok", "temporary mounts removed")
+            self._verify(report)
             report.success = True
         except Exception as exc:
             report.add("recovery", "failed", str(exc))
@@ -83,7 +89,9 @@ class RecoveryExecutor:
             self._cleanup(report)
             report.finished_at = datetime.now(timezone.utc).isoformat()
             if report_path:
-                Path(report_path).write_text(json.dumps(report.to_dict(), indent=2) + "\n", encoding="utf-8")
+                Path(report_path).write_text(
+                    json.dumps(report.to_dict(), indent=2) + "\n", encoding="utf-8"
+                )
         return report
 
     def _validate(self, plan: RepairPlan, confirmation: str) -> None:
@@ -99,13 +107,10 @@ class RecoveryExecutor:
             raise RecoveryError("explicit confirmation token REPAIR is required")
 
     def _require_tools(self) -> None:
-        required = ("mount", "umount", "chroot", "grub-install", "efibootmgr")
-        optional = ("update-grub", "grub-mkconfig", "grub2-mkconfig")
+        required = ("mount", "umount", "chroot", "efibootmgr", "tar")
         missing = [tool for tool in required if shutil.which(tool) is None]
         if missing:
             raise RecoveryError("missing required host tools: " + ", ".join(missing))
-        if not any(shutil.which(tool) for tool in optional):
-            raise RecoveryError("no GRUB configuration generator found")
 
     def _capture_state(self, report: RepairReport) -> None:
         result = self._command(("efibootmgr", "--verbose"), None)
@@ -122,33 +127,53 @@ class RecoveryExecutor:
         mount_args = ["mount", "-o", "rw"]
         fs = (plan.target.root_filesystem or "").lower()
         if fs == "btrfs" and plan.target.root_subvolume:
-            mount_args.extend(["-o", f"subvol={plan.target.root_subvolume}"])
+            mount_args[-1] = "rw,subvol=" + plan.target.root_subvolume
         mount_args.extend([plan.target.root_device, str(root)])
-        self._run_checked(mount_args, None, "mount Linux root")
+        self._run_checked(mount_args, "mount Linux root")
         self._mounted.append(root)
 
         boot_target = root / "boot"
         boot_target.mkdir(exist_ok=True)
         if plan.target.boot_device:
-            self._run_checked(("mount", "-o", "rw", plan.target.boot_device, str(boot_target)), None, "mount /boot")
+            self._run_checked(
+                ("mount", "-o", "rw", plan.target.boot_device, str(boot_target)),
+                "mount /boot",
+            )
             self._mounted.append(boot_target)
 
         efi_target = boot_target / "efi"
         efi_target.mkdir(exist_ok=True)
-        self._run_checked(("mount", "-o", "rw", plan.target.efi_device, str(efi_target)), None, "mount EFI System Partition")
+        self._run_checked(
+            ("mount", "-o", "rw", plan.target.efi_device, str(efi_target)),
+            "mount EFI System Partition",
+        )
         self._mounted.append(efi_target)
 
         for directory in ("/dev", "/dev/pts", "/proc", "/sys", "/run"):
             destination = root / directory.lstrip("/")
             destination.mkdir(parents=True, exist_ok=True)
-            self._run_checked(("mount", "--rbind", directory, str(destination)), None, f"bind {directory}")
-            self._run_checked(("mount", "--make-rslave", str(destination)), None, f"isolate {directory}")
+            self._run_checked(
+                ("mount", "--rbind", directory, str(destination)),
+                f"bind {directory}",
+            )
+            self._run_checked(
+                ("mount", "--make-rslave", str(destination)),
+                f"isolate {directory}",
+            )
             self._mounted.append(destination)
         report.add("mount-target", "ok", f"mounted target under {root}")
 
-    def _backup_efi(self, report: RepairReport) -> Path:
+    def _backup_efi(self, report: RepairReport) -> None:
         assert self._temp_root is not None
-        backup = self._temp_root / "root" / "var" / "lib" / "devil" / "backups" / datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        backup = (
+            self._temp_root
+            / "root"
+            / "var"
+            / "lib"
+            / "devil"
+            / "backups"
+            / datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        )
         backup.mkdir(parents=True, exist_ok=True)
         efi = self._temp_root / "root" / "boot" / "efi"
         archive = backup / "efi-tree.tar"
@@ -156,58 +181,65 @@ class RecoveryExecutor:
         if result.returncode != 0:
             raise RecoveryError(f"EFI backup failed: {result.stderr.strip()}")
         report.add("backup-efi", "ok", str(archive))
-        return backup
 
-    def _install_grub(self, plan: RepairPlan, report: RepairReport) -> None:
+    def _install_grub(self, report: RepairReport) -> None:
         assert self._temp_root is not None
         root = self._temp_root / "root"
-        efi = root / "boot" / "efi"
-        loader_id = "DEVIL-GRUB"
-        argv = (
-            "chroot",
-            str(root),
-            "/usr/sbin/grub-install",
-            "--target=x86_64-efi",
-            f"--efi-directory={efi.relative_to(root)}",
-            f"--bootloader-id={loader_id}",
-            "--recheck",
+        commands = (
+            ("/usr/sbin/grub-install", "grub-install"),
+            ("/usr/bin/grub-install", "grub-install"),
         )
-        result = self._command(argv, None)
-        if result.returncode != 0:
-            fallback = (
-                "chroot", str(root), "grub-install",
-                "--target=x86_64-efi",
-                f"--efi-directory={efi.relative_to(root)}",
-                f"--bootloader-id={loader_id}",
-                "--recheck",
+        for inside_path, label in commands:
+            if not self._inside_exists(root, inside_path):
+                continue
+            result = self._command(
+                (
+                    "chroot",
+                    str(root),
+                    inside_path,
+                    "--target=x86_64-efi",
+                    "--efi-directory=/boot/efi",
+                    "--bootloader-id=DEVIL-GRUB",
+                    "--recheck",
+                ),
+                None,
             )
-            result = self._command(fallback, None)
-        if result.returncode != 0:
-            raise RecoveryError(f"GRUB installation failed: {result.stderr.strip()}")
-        report.add("install-grub", "ok", f"installed UEFI loader {loader_id}")
+            if result.returncode == 0:
+                report.add("install-grub", "ok", f"installed UEFI loader DEVIL-GRUB via {label}")
+                return
+            detail = result.stderr.strip() or result.stdout.strip()
+            raise RecoveryError(f"GRUB installation failed: {detail}")
+        raise RecoveryError("target installation does not contain grub-install")
 
     def _regenerate_config(self, report: RepairReport) -> None:
         assert self._temp_root is not None
         root = self._temp_root / "root"
         candidates = (
-            ("chroot", str(root), "update-grub"),
-            ("chroot", str(root), "grub-mkconfig", "-o", "/boot/grub/grub.cfg"),
-            ("chroot", str(root), "grub2-mkconfig", "-o", "/boot/grub2/grub.cfg"),
+            "/usr/sbin/update-grub",
+            "/usr/bin/update-grub",
+            "/usr/sbin/grub-mkconfig",
+            "/usr/bin/grub-mkconfig",
+            "/usr/sbin/grub2-mkconfig",
+            "/usr/bin/grub2-mkconfig",
         )
-        for argv in candidates:
-            if argv[2] == "update-grub" and not self._inside_exists(root, "/usr/sbin/update-grub") and not self._inside_exists(root, "/usr/bin/update-grub"):
+        for inside_path in candidates:
+            if not self._inside_exists(root, inside_path):
                 continue
-            if argv[2] == "grub-mkconfig" and not self._inside_exists(root, "/usr/sbin/grub-mkconfig") and not self._inside_exists(root, "/usr/bin/grub-mkconfig"):
-                continue
-            if argv[2] == "grub2-mkconfig" and not self._inside_exists(root, "/usr/sbin/grub2-mkconfig") and not self._inside_exists(root, "/usr/bin/grub2-mkconfig"):
-                continue
+            if inside_path.endswith("update-grub"):
+                argv = ("chroot", str(root), inside_path)
+            elif "grub2-mkconfig" in inside_path:
+                argv = ("chroot", str(root), inside_path, "-o", "/boot/grub2/grub.cfg")
+            else:
+                argv = ("chroot", str(root), inside_path, "-o", "/boot/grub/grub.cfg")
             result = self._command(argv, None)
             if result.returncode == 0:
-                report.add("regenerate-config", "ok", argv[2])
+                report.add("regenerate-config", "ok", inside_path)
                 return
-        raise RecoveryError("GRUB configuration generation failed")
+            detail = result.stderr.strip() or result.stdout.strip()
+            raise RecoveryError(f"GRUB configuration generation failed: {detail}")
+        raise RecoveryError("target installation does not contain a GRUB configuration generator")
 
-    def _verify(self, plan: RepairPlan, report: RepairReport) -> None:
+    def _verify(self, report: RepairReport) -> None:
         after = self._command(("efibootmgr", "--verbose"), None)
         if after.returncode != 0:
             raise RecoveryError("EFI verification failed")
@@ -216,16 +248,21 @@ class RecoveryExecutor:
             raise RecoveryError("new DEVIL-GRUB EFI entry was not observed")
         if "windows boot manager" in self._efi_before.lower() and "windows boot manager" not in lower:
             raise RecoveryError("Windows Boot Manager disappeared during repair")
-        report.add("verify-efi", "ok", "DEVIL-GRUB present; pre-existing Windows entry preserved when detected")
+        report.add(
+            "verify-efi",
+            "ok",
+            "DEVIL-GRUB present; pre-existing Windows entry preserved when detected",
+        )
 
     @staticmethod
     def _inside_exists(root: Path, path: str) -> bool:
         return (root / path.lstrip("/")).exists()
 
-    def _run_checked(self, argv: Sequence[str], cwd: Path | None, label: str) -> None:
-        result = self._command(argv, cwd)
+    def _run_checked(self, argv: Sequence[str], label: str) -> None:
+        result = self._command(argv, None)
         if result.returncode != 0:
-            raise RecoveryError(f"{label} failed: {result.stderr.strip()}")
+            detail = result.stderr.strip() or result.stdout.strip()
+            raise RecoveryError(f"{label} failed: {detail}")
 
     def _cleanup(self, report: RepairReport) -> None:
         for mountpoint in reversed(self._mounted):
@@ -233,11 +270,15 @@ class RecoveryExecutor:
             if result.returncode != 0:
                 result = self._command(("umount", str(mountpoint)), None)
                 if result.returncode != 0:
-                    report.warnings.append(f"Could not unmount {mountpoint}: {result.stderr.strip()}")
+                    report.warnings.append(
+                        f"Could not unmount {mountpoint}: {result.stderr.strip()}"
+                    )
         self._mounted.clear()
         if self._temp_root:
             try:
                 shutil.rmtree(self._temp_root)
             except OSError as exc:
-                report.warnings.append(f"Could not remove temporary directory {self._temp_root}: {exc}")
+                report.warnings.append(
+                    f"Could not remove temporary directory {self._temp_root}: {exc}"
+                )
             self._temp_root = None
