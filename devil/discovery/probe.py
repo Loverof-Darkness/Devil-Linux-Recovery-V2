@@ -38,12 +38,13 @@ class ReadOnlyFilesystemProbe:
         esp_device: str | None,
     ) -> ProbeResult:
         if not self._mount or not self._umount:
-            # Already-mounted candidates can still be inspected without mount tools.
             if not any(part.mountpoint for part in partitions):
                 return ProbeResult(
                     warnings=("Filesystem probing skipped: mount/umount unavailable",)
                 )
-        if os.geteuid() != 0 and any(not part.mountpoint for part in partitions if part.filesystem in _LINUX_FS):
+        if os.geteuid() != 0 and any(
+            not part.mountpoint for part in partitions if part.filesystem in _LINUX_FS
+        ):
             return ProbeResult(
                 warnings=(
                     "Filesystem probing of unmounted Linux partitions skipped: "
@@ -131,7 +132,15 @@ class ReadOnlyFilesystemProbe:
         firmware_mode: str,
     ) -> ProbeResult:
         loader = root / "EFI" / "Microsoft" / "Boot" / "bootmgfw.efi"
-        if not loader.is_file():
+        try:
+            exists = loader.is_file()
+        except OSError as exc:
+            return ProbeResult(
+                warnings=(
+                    f"Could not inspect EFI System Partition {esp.device}: {exc}",
+                )
+            )
+        if not exists:
             return ProbeResult()
         return ProbeResult(
             operating_systems=(
