@@ -4,10 +4,10 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "devil-linux-recovery-v2"
-version = "0.1.0"
+version = "0.2.0"
 description = "Universal Linux boot recovery platform"
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 license = { text = "GPL-2.0-only" }
 authors = [{ name = "Loverof-Darkness" }]
 dependencies = []
