@@ -33,12 +33,6 @@ def _mountpoint(raw: Any) -> str | None:
     return raw or None
 
 
-def _linux_partition(partitions: list[Partition], device: str | None) -> Partition | None:
-    if not device:
-        return None
-    return next((part for part in partitions if part.device == device), None)
-
-
 def scan(runner: CommandRunner | None = None, probe: ReadOnlyFilesystemProbe | None = None) -> DiscoverySnapshot:
     runner = runner or CommandRunner()
     probe = probe or ReadOnlyFilesystemProbe()
@@ -93,17 +87,15 @@ def scan(runner: CommandRunner | None = None, probe: ReadOnlyFilesystemProbe | N
     ]
 
     esp_parts = [p for p in snapshot.partitions if p.esp]
-    unique_esp = esp_parts[0] if len(esp_parts) == 1 else None
-    unique_efi_device = unique_esp.device if unique_esp else None
+    unique_efi_device = esp_parts[0].device if len(esp_parts) == 1 else None
 
     # Mounted roots can be identified without changing anything.
     mounted_linux = [p for p in snapshot.partitions if p.filesystem in _LINUX_FS and p.mountpoint]
     for index, part in enumerate(mounted_linux, 1):
-        name = part.label or "Linux installation"
         snapshot.operating_systems.append(
             OperatingSystem(
                 os_id=f"linux-mounted-{index}",
-                name=name,
+                name=part.label or "Linux installation",
                 family="linux",
                 root_device=part.device,
                 root_mountpoint=part.mountpoint,
@@ -115,22 +107,26 @@ def scan(runner: CommandRunner | None = None, probe: ReadOnlyFilesystemProbe | N
 
     # Live-USB environments usually leave installed roots unmounted. Probe those
     # filesystems read-only when privileges and mount support are available.
-    if hasattr(probe, "probe_linux"):
-        result = probe.probe_linux(snapshot.partitions, snapshot.firmware_mode, unique_efi_device)
-        existing_devices = {system.root_device for system in snapshot.operating_systems}
-        for system in result.operating_systems:
-            if system.root_device not in existing_devices:
-                snapshot.operating_systems.append(system)
-        snapshot.warnings.extend(result.warnings)
+    result = probe.probe_linux(snapshot.partitions, snapshot.firmware_mode, unique_efi_device)
+    existing_devices = {system.root_device for system in snapshot.operating_systems}
+    for system in result.operating_systems:
+        if system.root_device not in existing_devices:
+            snapshot.operating_systems.append(system)
+    snapshot.warnings.extend(result.warnings)
 
-    # Windows is only identified from an actual Microsoft EFI loader, not merely
-    # because an EFI/FAT partition exists.
-    if hasattr(probe, "probe_windows_efi"):
-        windows_probe = probe.probe_windows_efi(unique_esp, snapshot.firmware_mode)
-        snapshot.operating_systems.extend(windows_probe.operating_systems)
+    # Probe each ESP for an actual Microsoft loader. Multiple ESPs are still
+    # ambiguous for repairing Linux, but should not hide evidence of Windows.
+    windows_found = set()
+    for esp in esp_parts:
+        windows_probe = probe.probe_windows_efi(esp, snapshot.firmware_mode)
+        for system in windows_probe.operating_systems:
+            if system.os_id not in windows_found:
+                snapshot.operating_systems.append(system)
+                windows_found.add(system.os_id)
         snapshot.warnings.extend(windows_probe.warnings)
 
-    # Firmware entries still provide evidence even where filesystem probing is unavailable.
+    # Firmware entries provide additional Windows evidence when filesystem
+    # probing is unavailable (for example when no ESP can be mounted).
     windows_entry_names = tuple(
         entry.label for entry in snapshot.efi_entries if "windows" in entry.label.lower()
     )
