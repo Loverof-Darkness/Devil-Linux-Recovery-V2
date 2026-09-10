@@ -75,5 +75,11 @@ def test_scan_builds_linux_and_windows_candidates(monkeypatch) -> None:
 
 def test_mounted_non_root_filesystem_without_os_release_is_not_linux(tmp_path: Path):
     part = Partition(device="/dev/sda5", filesystem="ext4", mountpoint=str(tmp_path), label="data")
-    result = ReadOnlyFilesystemProbe._identify_linux_root(tmp_path, part, "uefi", "/dev/sda1")
+    result = ReadOnlyFilesystemProbe._system_from_os_release(
+        part,
+        {},
+        "uefi",
+        "/dev/sda1",
+        root_mountpoint=str(tmp_path),
+    )
     assert result is None
