@@ -1,8 +1,8 @@
 """Read-only filesystem probes for Live USB discovery.
 
-Probes mount candidate filesystems read-only in a temporary directory, inspect
-small well-known metadata files, and always attempt cleanup. No filesystem is
-formatted, activated, or modified by this module.
+The probe layer uses already-mounted filesystems directly and mounts only
+unmounted candidates read-only in a temporary directory. It never formats,
+unlocks, activates, or modifies storage.
 """
 from __future__ import annotations
 
@@ -17,6 +17,9 @@ from pathlib import Path
 from devil.models.discovery import OperatingSystem, Partition
 
 
+_LINUX_FS = {"ext2", "ext3", "ext4", "btrfs", "xfs", "f2fs"}
+
+
 @dataclass(frozen=True)
 class ProbeResult:
     operating_systems: tuple[OperatingSystem, ...] = ()
@@ -28,69 +31,121 @@ class ReadOnlyFilesystemProbe:
         self._mount = shutil.which("mount")
         self._umount = shutil.which("umount")
 
-    def probe_linux(self, partitions: list[Partition], firmware_mode: str, esp_device: str | None) -> ProbeResult:
+    def probe_linux(
+        self,
+        partitions: list[Partition],
+        firmware_mode: str,
+        esp_device: str | None,
+    ) -> ProbeResult:
         if not self._mount or not self._umount:
-            return ProbeResult(warnings=("Filesystem probing skipped: mount/umount unavailable",))
-        if os.geteuid() != 0:
-            return ProbeResult(warnings=("Filesystem probing skipped: root privileges are required for safe read-only mounts",))
+            # Already-mounted candidates can still be inspected without mount tools.
+            if not any(part.mountpoint for part in partitions):
+                return ProbeResult(
+                    warnings=("Filesystem probing skipped: mount/umount unavailable",)
+                )
+        if os.geteuid() != 0 and any(not part.mountpoint for part in partitions if part.filesystem in _LINUX_FS):
+            return ProbeResult(
+                warnings=(
+                    "Filesystem probing of unmounted Linux partitions skipped: "
+                    "root privileges are required for safe read-only mounts",
+                )
+            )
 
         found: list[OperatingSystem] = []
         warnings: list[str] = []
         for part in partitions:
-            if part.mountpoint or part.filesystem not in {"ext2", "ext3", "ext4", "btrfs", "xfs", "f2fs"}:
+            if part.filesystem not in _LINUX_FS:
                 continue
+
+            if part.mountpoint:
+                root = Path(part.mountpoint)
+                system = self._identify_linux_root(root, part, firmware_mode, esp_device)
+                if system is not None:
+                    found.append(system)
+                continue
+
             with self._mounted(part.device, part.filesystem) as (root, error):
                 if error or root is None:
                     warnings.append(f"Could not probe {part.device}: {error}")
                     continue
-                os_release = self._read_os_release(root)
-                if not os_release or not self._looks_like_linux(os_release):
-                    continue
-                os_id_value = os_release.get("ID", "linux").lower()
-                name = os_release.get("PRETTY_NAME") or os_release.get("NAME") or "Linux"
-                root_subvolume = self._btrfs_root_subvolume(root, part.filesystem)
-                found.append(
-                    OperatingSystem(
-                        os_id=f"probe-{os_id_value}-{part.uuid or part.device}",
-                        name=name,
-                        family="linux",
-                        root_device=part.device,
-                        root_mountpoint=None,
-                        root_subvolume=root_subvolume,
-                        boot_device=None,
-                        efi_device=esp_device,
-                        firmware_mode=firmware_mode,
-                        confidence="high",
-                    )
-                )
+                system = self._identify_linux_root(root, part, firmware_mode, esp_device)
+                if system is not None:
+                    found.append(system)
         return ProbeResult(tuple(found), tuple(warnings))
 
     def probe_windows_efi(self, esp: Partition | None, firmware_mode: str) -> ProbeResult:
         if esp is None:
             return ProbeResult()
+
+        if esp.mountpoint:
+            return self._identify_windows_loader(Path(esp.mountpoint), esp, firmware_mode)
+
         if not self._mount or not self._umount:
-            return ProbeResult(warnings=("Windows EFI probing skipped: mount/umount unavailable",))
-        if os.geteuid() != 0:
-            return ProbeResult(warnings=("Windows EFI probing skipped: root privileges are required for safe read-only mounts",))
-        with self._mounted(esp.device, esp.filesystem or "vfat") as (root, error):
-            if error or root is None:
-                return ProbeResult(warnings=(f"Could not probe EFI System Partition {esp.device}: {error}",))
-            loader = root / "EFI" / "Microsoft" / "Boot" / "bootmgfw.efi"
-            if not loader.is_file():
-                return ProbeResult()
             return ProbeResult(
-                operating_systems=(
-                    OperatingSystem(
-                        os_id="windows-efi",
-                        name="Windows Boot Manager",
-                        family="windows",
-                        efi_device=esp.device,
-                        firmware_mode=firmware_mode,
-                        bootloaders=(r"EFI\Microsoft\Boot\bootmgfw.efi",),
-                        confidence="high",
-                    ),
+                warnings=("Windows EFI probing skipped: mount/umount unavailable",)
+            )
+        if os.geteuid() != 0:
+            return ProbeResult(
+                warnings=(
+                    "Windows EFI probing skipped: root privileges are required for "
+                    "safe read-only mounts",
                 )
             )
+        with self._mounted(esp.device, esp.filesystem or "vfat") as (root, error):
+            if error or root is None:
+                return ProbeResult(
+                    warnings=(f"Could not probe EFI System Partition {esp.device}: {error}",)
+                )
+            return self._identify_windows_loader(root, esp, firmware_mode)
+
+    @staticmethod
+    def _identify_linux_root(
+        root: Path,
+        part: Partition,
+        firmware_mode: str,
+        esp_device: str | None,
+    ) -> OperatingSystem | None:
+        os_release = ReadOnlyFilesystemProbe._read_os_release(root)
+        if not os_release or not ReadOnlyFilesystemProbe._looks_like_linux(os_release):
+            return None
+        os_id_value = os_release.get("ID", "linux").lower()
+        name = os_release.get("PRETTY_NAME") or os_release.get("NAME") or "Linux"
+        root_subvolume = ReadOnlyFilesystemProbe._btrfs_root_subvolume(root, part.filesystem)
+        return OperatingSystem(
+            os_id=f"probe-{os_id_value}-{part.uuid or part.device}",
+            name=name,
+            family="linux",
+            root_device=part.device,
+            root_mountpoint=str(root),
+            root_subvolume=root_subvolume,
+            boot_device=None,
+            efi_device=esp_device,
+            firmware_mode=firmware_mode,
+            confidence="high",
+        )
+
+    @staticmethod
+    def _identify_windows_loader(
+        root: Path,
+        esp: Partition,
+        firmware_mode: str,
+    ) -> ProbeResult:
+        loader = root / "EFI" / "Microsoft" / "Boot" / "bootmgfw.efi"
+        if not loader.is_file():
+            return ProbeResult()
+        return ProbeResult(
+            operating_systems=(
+                OperatingSystem(
+                    os_id="windows-efi",
+                    name="Windows Boot Manager",
+                    family="windows",
+                    efi_device=esp.device,
+                    firmware_mode=firmware_mode,
+                    bootloaders=(r"EFI\Microsoft\Boot\bootmgfw.efi",),
+                    confidence="high",
+                ),
+            )
+        )
 
     class _MountContext:
         def __init__(self, owner: "ReadOnlyFilesystemProbe", device: str, filesystem: str) -> None:
