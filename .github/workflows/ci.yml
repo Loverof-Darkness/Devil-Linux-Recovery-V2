@@ -32,7 +32,9 @@ jobs:
         run: python -m pytest -q
 
       - name: Shell syntax check
-        run: bash -n launcher/devil.sh
+        run: |
+          bash -n launcher/devil.sh
+          bash -n scripts/recovery-lab.sh
 
       - name: Bootstrap source smoke test
         run: bash launcher/devil.sh --source --diagnose
