@@ -40,18 +40,15 @@ class ReadOnlyFilesystemProbe:
             if part.mountpoint or part.filesystem not in {"ext2", "ext3", "ext4", "btrfs", "xfs", "f2fs"}:
                 continue
             with self._mounted(part.device, part.filesystem) as (root, error):
-                if error:
+                if error or root is None:
                     warnings.append(f"Could not probe {part.device}: {error}")
                     continue
                 os_release = self._read_os_release(root)
-                if not os_release:
-                    continue
-                if not self._looks_like_linux(os_release):
+                if not os_release or not self._looks_like_linux(os_release):
                     continue
                 os_id_value = os_release.get("ID", "linux").lower()
                 name = os_release.get("PRETTY_NAME") or os_release.get("NAME") or "Linux"
                 root_subvolume = self._btrfs_root_subvolume(root, part.filesystem)
-                boot_device = part.device if (root / "boot").is_dir() else None
                 found.append(
                     OperatingSystem(
                         os_id=f"probe-{os_id_value}-{part.uuid or part.device}",
@@ -60,7 +57,7 @@ class ReadOnlyFilesystemProbe:
                         root_device=part.device,
                         root_mountpoint=None,
                         root_subvolume=root_subvolume,
-                        boot_device=boot_device,
+                        boot_device=None,
                         efi_device=esp_device,
                         firmware_mode=firmware_mode,
                         confidence="high",
@@ -76,7 +73,7 @@ class ReadOnlyFilesystemProbe:
         if os.geteuid() != 0:
             return ProbeResult(warnings=("Windows EFI probing skipped: root privileges are required for safe read-only mounts",))
         with self._mounted(esp.device, esp.filesystem or "vfat") as (root, error):
-            if error:
+            if error or root is None:
                 return ProbeResult(warnings=(f"Could not probe EFI System Partition {esp.device}: {error}",))
             loader = root / "EFI" / "Microsoft" / "Boot" / "bootmgfw.efi"
             if not loader.is_file():
@@ -174,12 +171,18 @@ class ReadOnlyFilesystemProbe:
     def _btrfs_root_subvolume(root: Path, filesystem: str | None) -> str | None:
         if (filesystem or "").lower() != "btrfs":
             return None
-        marker = root / ".btrfs_subvolume"
-        if marker.is_file():
-            try:
-                value = marker.read_text(encoding="utf-8", errors="replace").strip()
-                if value and re.fullmatch(r"[A-Za-z0-9_.@/-]+", value):
-                    return value
-            except OSError:
-                pass
-        return "@" if (root / "@").is_dir() else None
+        try:
+            mountinfo = Path("/proc/self/mountinfo").read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return None
+        target = str(root).replace(" ", r"\040").replace("\t", r"\011")
+        for line in mountinfo.splitlines():
+            fields = line.split(" ")
+            if len(fields) < 7 or fields[4] != target or " - " not in line:
+                continue
+            suffix = line.split(" - ", 1)[1]
+            match = re.search(r"(?:^|,)subvol=([^, ]+)", suffix)
+            if match:
+                value = match.group(1)
+                return value if re.fullmatch(r"[A-Za-z0-9_.@/+:-]+", value) else None
+        return None
