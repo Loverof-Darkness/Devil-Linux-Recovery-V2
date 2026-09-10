@@ -56,6 +56,8 @@ def build_repair_plan(target: TargetLayout) -> RepairPlan:
         reasons.append("Linux root device is unresolved")
     if not target.efi_device:
         reasons.append("EFI System Partition is unresolved")
+    if target.root_filesystem and target.root_filesystem.lower() == "btrfs" and not target.root_subvolume:
+        reasons.append("Btrfs root subvolume is unresolved; refusing to mount the filesystem default subvolume")
 
     if reasons:
         return RepairPlan(target, False, False, tuple(dict.fromkeys(reasons)))
