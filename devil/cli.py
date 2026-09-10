@@ -67,7 +67,7 @@ def main(argv: list[str] | None = None) -> int:
     print(
         render_systems(snapshot.operating_systems)
         if snapshot.operating_systems
-        else "No operating systems confidently identified from current mounts."
+        else "No operating systems confidently identified from the current storage state."
     )
 
     if snapshot.warnings:
@@ -83,7 +83,7 @@ def main(argv: list[str] | None = None) -> int:
         print("\nNo Linux recovery candidates are available.")
         return 2
 
-    answer = input("\nSelect Linux installation [number]: ")
+    answer = input("\nSelect Linux installation [Linux number]: ")
     index = _safe_int(answer)
     target = resolve_selected_linux(snapshot, snapshot.operating_systems, index)
     if target is None:
@@ -97,7 +97,7 @@ def main(argv: list[str] | None = None) -> int:
             return 2
         print(f"\nSelected: {selected.name}")
         print(f"Root: {selected.root_device}")
-        print(f"Mount: {selected.root_mountpoint}")
+        print(f"Mount: {selected.root_mountpoint or 'not currently mounted'}")
         return 0
 
     print()
@@ -119,7 +119,11 @@ def main(argv: list[str] | None = None) -> int:
         print("Confirmation rejected. No changes were made.")
         return 2
 
-    report = RecoveryExecutor().execute(plan, confirmation=confirmation, report_path=args.report)
+    report = RecoveryExecutor().execute(
+        plan,
+        confirmation=confirmation,
+        report_path=args.report,
+    )
     print("\nRepair result: " + ("SUCCESS" if report.success else "FAILED"))
     for step in report.steps:
         print(f"  [{step['status']}] {step['step']}: {step['detail']}")
