@@ -4,6 +4,7 @@ from typing import Any
 
 from devil.discovery import blkid, efi, firmware, lsblk
 from devil.discovery.commands import CommandRunner
+from devil.discovery.probe import ReadOnlyFilesystemProbe
 from devil.models.discovery import DiscoverySnapshot, OperatingSystem, Partition
 
 
@@ -32,8 +33,15 @@ def _mountpoint(raw: Any) -> str | None:
     return raw or None
 
 
-def scan(runner: CommandRunner | None = None) -> DiscoverySnapshot:
+def _linux_partition(partitions: list[Partition], device: str | None) -> Partition | None:
+    if not device:
+        return None
+    return next((part for part in partitions if part.device == device), None)
+
+
+def scan(runner: CommandRunner | None = None, probe: ReadOnlyFilesystemProbe | None = None) -> DiscoverySnapshot:
     runner = runner or CommandRunner()
+    probe = probe or ReadOnlyFilesystemProbe()
     snapshot = DiscoverySnapshot(firmware_mode=firmware.detect_firmware())
 
     nodes = lsblk.collect(runner)
@@ -47,7 +55,10 @@ def scan(runner: CommandRunner | None = None) -> DiscoverySnapshot:
         fstype = node.get("fstype") or blkid_map.get(device, {}).get("TYPE")
         parttype = node.get("parttype")
         flags = str(node.get("partflags") or "").lower()
-        esp = bool(fstype in _EFI_FS and (parttype or "").lower() in {"c12a7328-f81f-11d2-ba4b-00a0c93ec93b", "ef00"}) or "esp" in flags
+        esp = bool(
+            fstype in _EFI_FS
+            and (parttype or "").lower() in {"c12a7328-f81f-11d2-ba4b-00a0c93ec93b", "ef00"}
+        ) or "esp" in flags
         partition = Partition(
             device=device,
             parent_disk=node.get("_parent_disk") or node.get("pkname"),
@@ -71,43 +82,68 @@ def scan(runner: CommandRunner | None = None) -> DiscoverySnapshot:
             })
 
     snapshot.efi_entries = efi.collect(runner)
-    snapshot.capabilities = {name: runner.available(name) for name in ("lsblk", "blkid", "btrfs", "efibootmgr")}
+    snapshot.capabilities = {
+        name: runner.available(name)
+        for name in ("lsblk", "blkid", "btrfs", "efibootmgr")
+    }
     snapshot.warnings = [
         f"Missing command: {name}"
         for name, available in snapshot.capabilities.items()
         if not available
     ]
 
-    # Conservative OS candidates: only mounted Linux filesystems are surfaced automatically.
-    linux_parts = [p for p in snapshot.partitions if p.filesystem in _LINUX_FS and p.mountpoint]
-    for index, part in enumerate(linux_parts, 1):
+    esp_parts = [p for p in snapshot.partitions if p.esp]
+    unique_esp = esp_parts[0] if len(esp_parts) == 1 else None
+    unique_efi_device = unique_esp.device if unique_esp else None
+
+    # Mounted roots can be identified without changing anything.
+    mounted_linux = [p for p in snapshot.partitions if p.filesystem in _LINUX_FS and p.mountpoint]
+    for index, part in enumerate(mounted_linux, 1):
         name = part.label or "Linux installation"
-        os_id = f"linux-{index}"
         snapshot.operating_systems.append(
             OperatingSystem(
-                os_id=os_id,
+                os_id=f"linux-mounted-{index}",
                 name=name,
                 family="linux",
                 root_device=part.device,
                 root_mountpoint=part.mountpoint,
-                efi_device=next((p.device for p in snapshot.partitions if p.esp), None),
+                efi_device=unique_efi_device,
                 firmware_mode=snapshot.firmware_mode,
                 confidence="medium",
             )
         )
 
-    if any(p.filesystem in _EFI_FS for p in snapshot.partitions):
+    # Live-USB environments usually leave installed roots unmounted. Probe those
+    # filesystems read-only when privileges and mount support are available.
+    if hasattr(probe, "probe_linux"):
+        result = probe.probe_linux(snapshot.partitions, snapshot.firmware_mode, unique_efi_device)
+        existing_devices = {system.root_device for system in snapshot.operating_systems}
+        for system in result.operating_systems:
+            if system.root_device not in existing_devices:
+                snapshot.operating_systems.append(system)
+        snapshot.warnings.extend(result.warnings)
+
+    # Windows is only identified from an actual Microsoft EFI loader, not merely
+    # because an EFI/FAT partition exists.
+    if hasattr(probe, "probe_windows_efi"):
+        windows_probe = probe.probe_windows_efi(unique_esp, snapshot.firmware_mode)
+        snapshot.operating_systems.extend(windows_probe.operating_systems)
+        snapshot.warnings.extend(windows_probe.warnings)
+
+    # Firmware entries still provide evidence even where filesystem probing is unavailable.
+    windows_entry_names = tuple(
+        entry.label for entry in snapshot.efi_entries if "windows" in entry.label.lower()
+    )
+    if windows_entry_names and not any(item.family.lower() == "windows" for item in snapshot.operating_systems):
         snapshot.operating_systems.append(
             OperatingSystem(
-                os_id="windows-candidate",
-                name="Windows boot environment",
+                os_id="windows-efi-entry",
+                name="Windows Boot Manager",
                 family="windows",
-                efi_device=next((p.device for p in snapshot.partitions if p.esp or p.filesystem in _EFI_FS), None),
+                efi_device=unique_efi_device,
                 firmware_mode=snapshot.firmware_mode,
-                bootloaders=tuple(
-                    entry.label for entry in snapshot.efi_entries if "windows" in entry.label.lower()
-                ),
-                confidence="low",
+                bootloaders=windows_entry_names,
+                confidence="medium",
             )
         )
 
